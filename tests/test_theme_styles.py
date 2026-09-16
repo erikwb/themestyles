@@ -77,6 +77,11 @@ class StylesTests(unittest.TestCase):
         (current / "background").unlink(missing_ok=True)
         (current / "background").symlink_to(next((current / "theme/backgrounds").iterdir()))
 
+    def select_wallpaper(self, path):
+        link = self.service.current / "background"
+        link.unlink(missing_ok=True)
+        link.symlink_to(path)
+
     def request(self, name="Winter", auto_apply=False):
         return self.service.start("alpha", "Snow and twilight", name, auto_apply=auto_apply, spawn=False)["job"]
 
@@ -235,6 +240,120 @@ class StylesTests(unittest.TestCase):
         original = root / "original/wallpaper.png"
         self.assertEqual(reference.read_bytes(), original.read_bytes())
         self.assertNotEqual(reference.read_bytes(), (self.service.current / "background").read_bytes())
+
+    def test_first_generation_uses_selected_wallpaper_not_first_in_theme(self):
+        default = (self.service.current / "background").read_bytes()
+        selected = self.service.current / "theme/backgrounds/second.png"
+        png(selected, (100, 10, 30))
+        self.select_wallpaper(selected)
+        job = self.request()
+        reference = self.service.root("alpha") / "jobs" / job["id"] / job["reference"]
+        self.assertEqual(reference.read_bytes(), selected.read_bytes())
+        self.assertNotEqual(reference.read_bytes(), default)
+
+    def test_switching_wallpaper_after_first_generation_changes_next_reference(self):
+        self.request()
+        self.service.update_job("alpha", state="done")
+        root = self.service.root("alpha")
+        original = (root / "original/wallpaper.png").read_bytes()
+        selected = self.service.current / "theme/backgrounds/second.png"
+        png(selected, (100, 10, 30))
+        self.select_wallpaper(selected)
+        job = self.request("Summer")
+        reference = root / "jobs" / job["id"] / job["reference"]
+        self.assertEqual(reference.read_bytes(), selected.read_bytes())
+        self.assertNotEqual(reference.read_bytes(), original)
+        self.assertEqual((root / "original/wallpaper.png").read_bytes(), original)
+
+    def test_saved_style_keeps_its_own_source_after_job_cleanup(self):
+        self.request()
+        self.service.update_job("alpha", state="done")
+        selected = self.service.current / "theme/backgrounds/second.png"
+        png(selected, (100, 10, 30))
+        source = selected.read_bytes()
+        self.select_wallpaper(selected)
+        second = self.request("Summer")
+        self.complete(second)
+        self.service.update_job("alpha", state="done")
+        self.service.apply("alpha", second["id"])
+        root = self.service.root("alpha")
+        shutil.rmtree(root / "jobs" / second["id"])
+        third = self.request("Summer dusk")
+        reference = root / "jobs" / third["id"] / third["reference"]
+        self.assertEqual(reference.read_bytes(), source)
+        self.assertNotEqual(reference.read_bytes(), (root / "original/wallpaper.png").read_bytes())
+        self.assertNotEqual(reference.read_bytes(), (self.service.current / "background").read_bytes())
+
+    def test_native_wallpaper_change_over_active_style_takes_precedence(self):
+        first = self.request()
+        self.complete(first)
+        self.service.update_job("alpha", state="done")
+        self.service.apply("alpha", first["id"])
+        selected = self.home / "other wallpaper.png"
+        png(selected, (100, 10, 30))
+        self.select_wallpaper(selected)
+        second = self.request("Summer")
+        reference = self.service.root("alpha") / "jobs" / second["id"] / second["reference"]
+        self.assertEqual(reference.read_bytes(), selected.read_bytes())
+
+    def test_legacy_style_can_use_its_job_reference(self):
+        first = self.request()
+        self.complete(first)
+        self.service.update_job("alpha", state="done")
+        root = self.service.root("alpha")
+        variant = root / "variants" / first["id"]
+        record = read_json(variant / "style.json")
+        (variant / record.pop("reference")).unlink()
+        write_json(variant / "style.json", record)
+        source = root / "jobs" / first["id"] / first["reference"]
+        png(source, (100, 10, 30))
+        self.service.apply("alpha", first["id"])
+        second = self.request("Summer")
+        self.assertEqual((root / "jobs" / second["id"] / second["reference"]).read_bytes(), source.read_bytes())
+
+    def test_missing_saved_reference_does_not_silently_use_another_wallpaper(self):
+        first = self.request()
+        self.complete(first)
+        self.service.update_job("alpha", state="done")
+        self.service.apply("alpha", first["id"])
+        root = self.service.root("alpha")
+        (root / "variants" / first["id"] / first["reference"]).unlink()
+        with self.assertRaisesRegex(StylesError, "source wallpaper is unavailable"):
+            self.request("Summer")
+        self.assertEqual([p.name for p in (root / "jobs").iterdir()], [first["id"]])
+
+    def test_switching_wallpaper_during_generation_keeps_reference_and_skips_apply(self):
+        job = self.request(auto_apply=True)
+        root = self.service.root("alpha")
+        reference = root / "jobs" / job["id"] / job["reference"]
+        frozen = reference.read_bytes()
+        selected = self.service.current / "theme/backgrounds/second.png"
+        png(selected, (100, 10, 30))
+        self.select_wallpaper(selected)
+        self.fake_pipeline()
+        self.service.worker("alpha", job["id"])
+        self.assertEqual(reference.read_bytes(), frozen)
+        self.assertEqual(self.service.context()["wallpaper"], str(selected))
+        self.assertEqual(self.service.context()["active"], "")
+        self.assertEqual(self.service.job("alpha")["state"], "done")
+        self.assertEqual(len(self.service.variants("alpha")), 1)
+
+    def test_wallpaper_change_while_copying_reference_rejects_request(self):
+        self.request()
+        self.service.update_job("alpha", state="done")
+        selected = self.service.current / "theme/backgrounds/second.png"
+        png(selected, (100, 10, 30))
+        original_copy = shutil.copyfile
+        def copy_and_switch(source, destination, *args, **kwargs):
+            result = original_copy(source, destination, *args, **kwargs)
+            if Path(destination).name.startswith("reference."):
+                self.select_wallpaper(selected)
+            return result
+        with patch("theme_styles.shutil.copyfile", side_effect=copy_and_switch):
+            with self.assertRaisesRegex(StylesError, "selected theme changed"):
+                self.request("Summer")
+        self.assertEqual(self.service.job("alpha")["state"], "done")
+        self.assertEqual(len(list((self.service.root("alpha") / "jobs").iterdir())), 1)
 
     def test_cross_theme_apply_is_rejected_before_mutation(self):
         job = self.request()

@@ -251,6 +251,39 @@ class Styles:
                 shutil.rmtree(staging)
         return original
 
+    def reference_source(self, context, original):
+        """Use the selected wallpaper, or the original behind an applied style."""
+        wallpaper = Path(context["wallpaper"])
+        if context["active"]:
+            style_id = validate_id(context["active"])
+            root = self.root(context["base"])
+            variant = root / "variants" / style_id
+            generated = {variant / "theme/backgrounds/style.png",
+                         self.current / "theme/backgrounds/style.png"}
+            if wallpaper in {path.resolve() for path in generated}:
+                record = read_json(variant / "style.json", {})
+                if record.get("reference"):
+                    name = record["reference"]
+                    if name not in {"reference" + suffix for suffix in IMAGE_SUFFIXES}:
+                        raise StylesError("This saved style has an invalid source wallpaper.")
+                    wallpaper = variant / name
+                else:
+                    # Earlier versions retained the reference only in the job.
+                    workspace = root / "jobs" / style_id
+                    request = read_json(workspace / "request.json", {})
+                    name = request.get("reference", "")
+                    if name in {"reference" + suffix for suffix in IMAGE_SUFFIXES} and (workspace / name).is_file():
+                        wallpaper = workspace / name
+                    else:
+                        source = read_json(original / "original.json", {})
+                        name = source.get("wallpaper", "")
+                        if name not in {"wallpaper" + suffix for suffix in IMAGE_SUFFIXES}:
+                            raise StylesError("The original wallpaper for this saved style is missing.")
+                        wallpaper = original / name
+        if not wallpaper.is_file() or wallpaper.suffix.lower() not in IMAGE_SUFFIXES:
+            raise StylesError("The source wallpaper is unavailable. Select a still-image wallpaper and try again.")
+        return wallpaper
+
     def start(self, base, style, name="", mode="auto", token="", auto_apply=False, spawn=True,
               harness=None, model=None, thinking=None):
         style = style.strip()
@@ -295,9 +328,17 @@ class Styles:
             job_id = uuid.uuid4().hex
             workspace = root / "jobs" / job_id
             workspace.mkdir(parents=True)
-            source = read_json(original / "original.json")
-            reference = workspace / ("reference" + Path(source["wallpaper"]).suffix)
-            shutil.copyfile(original / source["wallpaper"], reference)
+            try:
+                with lock(self.theme_lock, shared=True):
+                    self.require_context(self._context(), base, context["token"])
+                    source = self.reference_source(context, original)
+                    reference = workspace / ("reference" + source.suffix.lower())
+                    shutil.copyfile(source, reference)
+                    # Wallpaper cycling can update the link without the theme lock.
+                    self.require_context(self._context(), base, context["token"])
+            except Exception:
+                shutil.rmtree(workspace)
+                raise
             job = {"id": job_id, "base": base, "name": name, "style": style, "mode": mode,
                    "state": "starting", "message": "Starting image generation…", "started": time.time(),
                    "created_at": now(), "token": context["token"], "auto_apply": auto_apply,
@@ -484,7 +525,9 @@ class Styles:
             record = {"id": job["id"], "base": job["base"], "name": job["name"], "style": job["style"],
                       "mode": mode, "created_at": now(), "provider": job.get("harness", "codex"),
                       "harness": job.get("harness", "codex"), "model": job.get("model", ""),
-                      "thinking": job.get("thinking", "")}
+                      "thinking": job.get("thinking", ""), "reference": job["reference"]}
+            # Keep the source with the style so it survives cleanup of job logs.
+            shutil.copyfile(workspace / job["reference"], staging / job["reference"])
             write_json(staging / "style.json", record)
             write_json(theme / MARKER, {"plugin": PLUGIN_ID, "base": job["base"], "style_id": job["id"]})
             staging.rename(variants / job["id"])

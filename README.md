@@ -22,6 +22,8 @@ and press **Generate**. The description becomes its name; repeated descriptions
 get a number, such as `Winter 2`.
 
 - Generation runs in the background. The panel shows progress and a Cancel button.
+- For themes with several wallpapers, generation uses the one currently selected.
+  Each saved style retains its source wallpaper for future variations.
 - The result applies automatically if the theme and wallpaper haven't changed.
   Otherwise, it is saved for the original theme.
 - Click a saved style to apply it. This does not call an agent.
@@ -65,11 +67,16 @@ Styles, original snapshots, prompts, and logs live in
 Inspect logs before sharing them: they may contain prompts and agent output.
 Failed jobs are retained for troubleshooting.
 
-Each theme's first generation saves an original snapshot. Later generations
-start from that snapshot, even if the installed theme is updated. Applying a
-style updates Omarchy's runtime theme and calls its application refresh helpers
-and theme-set hook. The installed theme source is never edited. Application
-settings outside Omarchy's color templates retain their original styling.
+Each generation copies the active wallpaper before starting. If a saved style
+is active, it uses that style's original source instead of editing the generated
+image again. Switching wallpapers while a job runs does not change its source
+or trigger automatic application when it finishes.
+
+The original theme colors and application assets are snapshotted on the first
+generation and retained across theme updates. Applying a style updates Omarchy's
+runtime theme and calls its application refresh helpers and theme-set hook. The
+installed theme source is never edited. Application settings outside Omarchy's
+color templates retain their original styling.
 
 ## CLI
 
