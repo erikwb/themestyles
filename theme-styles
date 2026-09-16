@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+import sys
+
+# The shell watches the plugin directory; runtime bytecode writes would cause
+# unnecessary plugin reloads as the status helper starts.
+sys.dont_write_bytecode = True
+from theme_styles import main
+
+if __name__ == "__main__":
+    main()

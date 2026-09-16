@@ -1,0 +1,123 @@
+# Theme Styles
+
+An Omarchy bar plugin for making winter, summer, moonlit, or custom versions of
+your current theme. An agent generates the wallpaper; [Aether](https://github.com/omacom/aether)
+creates matching application colors. Saved styles stay with their original theme
+and do not appear as separate entries in Omarchy's theme picker.
+
+## Install
+
+Requires Omarchy Quattro (tested on 4.0.4), Python 3.11+, Aether, ImageMagick,
+and a signed-in agent. Install these separately; `python3`, `aether`, `magick`,
+and `omarchy` must be on your PATH. Desktop error notifications use `notify-send`.
+
+```sh
+omarchy plugin add https://github.com/erikwb/themestyles --enable
+```
+
+## Use
+
+Open the palette icon in the bar, describe a style, choose a harness and model,
+and press **Generate**. The description becomes its name; repeated descriptions
+get a number, such as `Winter 2`.
+
+- Generation runs in the background. The panel shows progress and a Cancel button.
+- The result applies automatically if the theme and wallpaper haven't changed.
+  Otherwise, it is saved for the original theme.
+- Click a saved style to apply it. This does not call an agent.
+- The trash button asks for confirmation. Deleting the active style restores
+  the original appearance first.
+- **Restore original**, or selecting the theme in Omarchy again, restores its
+  original appearance. Saved styles remain available here.
+- Errors are selectable. **Copy log path** copies the path to the most recent
+  generation log.
+
+App colors keep the original light/dark mode unless you choose otherwise.
+
+## Agents
+
+The harness picker detects installed, signed-in Codex, Grok, Claude Code, Pi,
+OpenCode, Muse, Gemini, Copilot, Cursor, Oh My Pi, Hermes, OpenClaw, and Crush.
+It does not install agents or test image generation during discovery. Reopen
+the panel after signing in or out.
+
+Models and thinking levels come from each adapter's available catalog or settings.
+**Harness default** and **Default** leave the choice to the harness when its
+adapter cannot enumerate options. Selections are saved separately for each theme.
+Changing harness resets the model and thinking level; changing model resets thinking.
+
+Image generation depends on the harness's existing tools, extensions, permissions,
+and account limits. A failed attempt shows an error and preserves the current style.
+It does not switch to another harness or install a missing image tool.
+
+These integrations are experimental. Discovery has been checked on live Codex,
+Grok, Claude Code, and Pi installations. The other adapters have fixture tests
+but still need testing with signed-in installations. Stored credentials can expire,
+so some login failures are only detected when generating.
+
+## Files and privacy
+
+The wallpaper and style prompt go to the selected agent and its image service.
+Generation may use paid account credits.
+
+Styles, original snapshots, prompts, and logs live in
+`$XDG_DATA_HOME/omarchy-theme-styles`, normally `~/.local/share/omarchy-theme-styles`.
+Inspect logs before sharing them: they may contain prompts and agent output.
+Failed jobs are retained for troubleshooting.
+
+Each theme's first generation saves an original snapshot. Later generations
+start from that snapshot, even if the installed theme is updated. Applying a
+style updates Omarchy's runtime theme and calls its application refresh helpers
+and theme-set hook. The installed theme source is never edited. Application
+settings outside Omarchy's color templates retain their original styling.
+
+## CLI
+
+Run `theme-styles` from a source checkout or the installed plugin directory.
+Commands return JSON. Use the current theme's `base` and saved style IDs from
+`status` in place of the examples below.
+
+```sh
+./theme-styles status
+./theme-styles agents
+./theme-styles start --theme tokyo-night --style 'Winter dusk' --apply
+./theme-styles apply --theme tokyo-night --id SAVED_STYLE_ID
+./theme-styles restore --theme tokyo-night
+./theme-styles delete --theme tokyo-night --id SAVED_STYLE_ID --yes
+./theme-styles cancel --theme tokyo-night
+```
+
+Omit `--apply` to save without applying. Use IDs from `agents` with `--harness`,
+`--model`, and `--thinking` to override the saved selection. `--name` supplies an
+explicit saved name, which must be unique within the theme. Theme-sensitive
+commands also accept `--token` from `status` to guard against a changed selection.
+
+## Development
+
+No build step or Python packages are required.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+omarchy plugin validate .
+./install.sh
+```
+
+Tests use temporary data and do not run paid generation. The native UI test
+requires Omarchy on Wayland and QtTest; it is skipped without that desktop environment.
+The installer copies runtime files to `~/.config/omarchy/plugins/io.weirdware.themestyles`
+and enables the widget. Run it after edits. If old QML persists, run `omarchy restart shell`.
+
+## Uninstall
+
+Restore the original theme, then remove the plugin:
+
+```sh
+omarchy theme set "$(cat ~/.local/state/omarchy/current/theme.name)"
+omarchy plugin remove io.weirdware.themestyles
+```
+
+Saved styles remain in the data directory so reinstalling recovers them.
+
+## License
+
+[MIT](LICENSE), Erik Bourget.
