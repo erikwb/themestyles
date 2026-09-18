@@ -23,7 +23,6 @@ Panel {
   property string commandAction: ""
   property real requestStarted: 0
   property real clockNow: Date.now()
-  property string mode: "auto"
   property var agents: []
   property string agentsTheme: ""
   property string harness: ""
@@ -105,7 +104,6 @@ Panel {
     var themeChanged = root.base !== value.base
     if (themeChanged) {
       styleInput.text = ""
-      root.mode = "auto"
       root.message = ""
       root.messageError = false
       viewport.contentY = 0
@@ -144,7 +142,7 @@ Panel {
   function generate() {
     if (!root.ready || root.generating || root.busy || !styleInput.text.trim()) return
     request("start", ["--style", styleInput.text.trim(),
-      "--mode", root.mode, "--harness", root.harness, "--model", root.model,
+      "--harness", root.harness, "--model", root.model,
       "--thinking", root.thinking, "--token", root.state.token, "--apply"])
   }
 
@@ -420,30 +418,15 @@ Panel {
             wrapMode: Text.Wrap
           }
 
-          RowLayout {
+          Button {
             width: parent.width
-            spacing: Style.space(8)
-            Dropdown {
-              Layout.fillWidth: true
-              label: "App colors"
-              showLabel: false
-              value: root.mode
-              options: [
-                {value: "auto", label: "Keep light / dark"},
-                {value: "dark", label: "Dark colors"},
-                {value: "light", label: "Light colors"}
-              ]
-              onChanged: function(value) { root.mode = value }
-            }
-            Button {
-              text: root.generating ? "Working…" : "Generate"
-              iconText: "󰏘"
-              bordered: true
-              focusable: true
-              enabled: root.ready && !root.generating && !root.busy && styleInput.text.trim() !== ""
-              opacity: enabled ? 1 : 0.45
-              onClicked: root.generate()
-            }
+            text: root.generating ? "Working…" : "Generate"
+            iconText: "󰏘"
+            bordered: true
+            focusable: true
+            enabled: root.ready && !root.generating && !root.busy && styleInput.text.trim() !== ""
+            opacity: enabled ? 1 : 0.45
+            onClicked: root.generate()
           }
 
           Column {

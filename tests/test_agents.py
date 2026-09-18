@@ -57,6 +57,17 @@ class AgentTests(unittest.TestCase):
              patch("agents.run", return_value=(0, '{"loggedIn": true}')):
             self.assertEqual([a["value"] for a in self.agents.catalog()], ["claude"])
 
+    def test_validating_selection_does_not_probe_unrelated_harnesses(self):
+        with patch("agents.safe_binary", return_value="/codex") as binary, \
+             patch("agents.run", return_value=(0, "Logged in using ChatGPT")):
+            selection = {"harness": "codex", "model": DEFAULT_MODEL, "thinking": ""}
+            self.assertEqual(self.agents.validate(selection), selection)
+            binary.assert_called_once_with("codex")
+        with patch("agents.safe_binary") as binary:
+            with self.assertRaises(AgentError):
+                self.agents.validate({"harness": "unknown", "model": DEFAULT_MODEL, "thinking": ""})
+            binary.assert_not_called()
+
     def test_grok_keeps_custom_models_but_excludes_hidden_and_stale_models(self):
         self.write(".grok/models_cache.json", {"auth_method": "session", "models": {
             "grok-image": {"info": {"name": "Grok", "model_family": "xai", "reasoning_efforts": [{"value": "low"}]}},

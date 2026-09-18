@@ -238,15 +238,18 @@ class Agents:
         rows = [r for r in rows if len(r) == 6 and r[4] in {"yes", "no"} and r[5] in {"yes", "no"}]
         # Check readiness through Pi so environment keys and custom providers
         # work too. Never request the --credentials option.
-        authenticated = set()
-        for provider in dict.fromkeys(r[0] for r in rows):
-            check_code, check = run(binary, "auth", "check", "--provider", provider, "--json")
+        def ready(provider):
             try:
+                check_code, check = run(binary, "auth", "check", "--provider", provider, "--json")
                 status = json.loads(check).get("status")
             except ValueError:
                 status = None
-            if (not check_code and status == "ready") or (status is None and provider in stored_providers):
-                authenticated.add(provider)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            return provider if ((status == "ready" and not check_code)
+                                or (status is None and provider in stored_providers)) else None
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            authenticated = set(filter(None, pool.map(ready, dict.fromkeys(r[0] for r in rows))))
         stored = read(directory / "models-store.json")
         custom = read(directory / "models.json").get("providers", {})
         settings = read(directory / "settings.json")
@@ -426,7 +429,7 @@ class Agents:
         return {"value": value, "label": label, "models": models,
                 "model": selected["value"], "thinking": thinking if thinking in levels else ""}
 
-    def catalog(self):
+    def catalog(self, harness=None):
         def inspect(name):
             binary = safe_binary(name)
             if not binary:
@@ -436,7 +439,8 @@ class Agents:
             except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
                 return None
         with ThreadPoolExecutor(max_workers=4) as pool:
-            return [entry for entry in pool.map(inspect, HARNESS_NAMES) if entry]
+            names = [harness] if harness in HARNESS_NAMES else ([] if harness else HARNESS_NAMES)
+            return [entry for entry in pool.map(inspect, names) if entry]
 
     def selection(self, saved=None, catalog=None):
         entries = self.catalog() if catalog is None else catalog
@@ -452,7 +456,8 @@ class Agents:
                 "thinking": effort if effort in {x["value"] for x in selected["thinking"]} else ""}
 
     def validate(self, selection):
-        if not selection or self.selection(selection) != selection:
+        catalog = self.catalog(harness=selection.get("harness")) if selection else []
+        if not selection or self.selection(selection, catalog) != selection:
             raise AgentError("That harness, model, or thinking level is no longer available. Reopen the panel to refresh.")
         return selection
 

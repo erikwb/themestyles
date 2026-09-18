@@ -34,7 +34,7 @@ get a number, such as `Winter 2`.
 - Errors are selectable. **Copy log path** copies the path to the most recent
   generation log.
 
-App colors keep the original light/dark mode unless you choose otherwise.
+App colors automatically preserve the original theme's light/dark mode.
 
 ## Agents
 

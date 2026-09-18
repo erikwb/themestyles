@@ -1,10 +1,13 @@
 """Behavior tests use an isolated home; no desktop or paid generation is touched."""
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import fcntl
 from pathlib import Path
 import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import zlib
@@ -66,7 +69,7 @@ class StylesTests(unittest.TestCase):
         (root / "kitty.conf").write_text("old colors\n")
         (root / "extra.asset").write_text("keep this\n")
 
-    def select(self, slug):
+    def select(self, slug, token=""):
         if hasattr(self, "calls"):
             self.calls.append(slug)
         current = self.service.current
@@ -796,6 +799,169 @@ print("No image tool is configured")
         self.assertEqual(mode, "dark")
         self.assertEqual(self.service.context(), before)
 
+    def test_native_mode_resolution_preserves_legacy_light_themes(self):
+        job = self.request()
+        theme = self.service.root("alpha") / "original/theme"
+        cases = [
+            ('mode = "light"\nbackground = "#101010"\n', False, "light"),
+            ('mode = "dark"\ntheme_type = "light"\n', True, "dark"),
+            ('theme_type = "light"\nbackground = "#101010"\n', False, "light"),
+            ('background = "#101010"\n', True, "light"),
+            ('background = "#ffffff"\n', False, "light"),
+            ('background = "#101010"\n', False, "dark"),
+        ]
+        for colors, marker, expected in cases:
+            with self.subTest(colors=colors, marker=marker):
+                (theme / "colors.toml").write_text(colors)
+                (theme / "light.mode").unlink(missing_ok=True)
+                if marker:
+                    (theme / "light.mode").touch()
+                self.assertEqual(self.service.original_mode("alpha"), expected)
+        self.service.update_job("alpha", state="done")
+        (theme / "colors.toml").write_text('background = "#ffffff"\n')
+        job = self.request("Another style")
+        self.assertEqual(job["mode"], "light")
+        workspace = self.service.root("alpha") / "jobs" / job["id"]
+        (workspace / "rendered").mkdir()
+        (workspace / "rendered/colors.toml").write_text(COLORS)
+        with patch.object(self.service, "run_process") as run:
+            _, mode = self.service.render(job, workspace, workspace / job["reference"])
+        self.assertEqual(mode, "light")
+        self.assertIn("--light-mode", run.call_args.args[0])
+
+    def test_restore_and_delete_recheck_selection_inside_native_lock(self):
+        job = self.saved_style()
+        self.service.apply("alpha", job["id"])
+        def switch_before_activate(base, token):
+            self.select("beta")
+            Styles.activate(self.service, base, token)
+        for deleting in (False, True):
+            with self.subTest(deleting=deleting):
+                self.select("alpha")
+                self.service.apply("alpha", job["id"])
+                token = self.service.context()["token"]
+                with patch.object(self.service, "activate", side_effect=switch_before_activate):
+                    with self.assertRaisesRegex(StylesError, "selected theme changed"):
+                        if deleting:
+                            self.service.delete("alpha", job["id"], token, confirmed=True)
+                        else:
+                            self.service.restore("alpha", token)
+                self.assertEqual(self.service.context()["base"], "beta")
+                self.assertTrue((self.service.root("alpha") / "variants" / job["id"]).is_dir())
+
+    def test_native_restore_holds_desktop_lock_and_rolls_back_failure(self):
+        job = self.saved_style()
+        self.service.apply("alpha", job["id"])
+        previous = self.service.context()
+        def failed_setter(argv, workspace, log, **kwargs):
+            with self.service.theme_lock.open("a") as handle:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(kwargs["env"]["OMARCHY_THEME_HEADLESS"], "1")
+            self.assertNotEqual(Path(kwargs["env"]["XDG_RUNTIME_DIR"]), self.service.theme_lock.parent)
+            self.select("alpha")
+            raise StylesError("Native setter failed after changing files")
+        with patch.object(self.service, "run_process", side_effect=failed_setter):
+            with self.assertRaisesRegex(StylesError, "Native setter failed"):
+                Styles.activate(self.service, "alpha", previous["token"])
+        restored = self.service.context()
+        self.assertEqual((restored["base"], restored["active"], restored["wallpaper"]),
+                         (previous["base"], previous["active"], previous["wallpaper"]))
+
+    def test_cancel_and_worker_status_updates_do_not_overwrite_each_other(self):
+        job = self.request()
+        captured = threading.Event()
+        release = threading.Event()
+        job_path = self.service.root("alpha") / "job.json"
+        def paused_read(path, default=None):
+            value = read_json(path, default)
+            if Path(path) == job_path and threading.current_thread().name.startswith("worker"):
+                captured.set()
+                if not release.wait(3):
+                    raise RuntimeError("Test worker was not released")
+            return value
+        with patch("theme_styles.read_json", side_effect=paused_read), \
+             ThreadPoolExecutor(max_workers=1, thread_name_prefix="worker") as workers, \
+             ThreadPoolExecutor(max_workers=1, thread_name_prefix="cancel") as cancellers:
+            worker = workers.submit(self.service.update_job, "alpha", expected_id=job["id"], state="theming")
+            try:
+                self.assertTrue(captured.wait(2))
+                cancellation = cancellers.submit(self.service.cancel, "alpha")
+                try:
+                    cancellation.result(timeout=0.1)
+                except FutureTimeout:
+                    pass
+            finally:
+                release.set()
+            worker.result(timeout=2)
+            cancellation.result(timeout=2)
+        status = self.service.job("alpha")
+        self.assertEqual(status["state"], "theming")
+        self.assertTrue(status["cancel_requested"])
+
+    def test_cancel_wins_before_applying_and_stale_workers_cannot_update_new_jobs(self):
+        job = self.request()
+        self.service.cancel("alpha")
+        with self.assertRaisesRegex(StylesError, "cancelled"):
+            self.service.update_job("alpha", expected_id=job["id"], state="applying")
+        with self.assertRaisesRegex(StylesError, "no longer active"):
+            self.service.update_job("alpha", expected_id="0" * 32, state="failed")
+        self.assertEqual(self.service.job("alpha")["id"], job["id"])
+        self.assertEqual(self.service.job("alpha")["state"], "starting")
+
+    def test_spawned_worker_does_not_write_into_plugin_directory(self):
+        plugin = self.home / "plugin"
+        plugin.mkdir()
+        source = Path(__file__).resolve().parents[1]
+        for name in ("theme_styles.py", "agents.py", "theme-styles"):
+            shutil.copyfile(source / name, plugin / name)
+        binaries = self.home / "bin"
+        binaries.mkdir()
+        agent = binaries / "codex"
+        agent.write_text('''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.stdin.read()
+Path("failure.json").write_text('{"error_code": "unsupported"}')
+''')
+        agent.chmod(0o755)
+        self.service.data = self.home / "omarchy-theme-styles"
+        children = []
+        popen = subprocess.Popen
+        def spawn(argv, **kwargs):
+            child = popen(argv, **kwargs)
+            if "worker" in argv:
+                children.append(child)
+            return child
+        env = {"HOME": str(self.home), "XDG_DATA_HOME": str(self.home),
+               "XDG_RUNTIME_DIR": str(self.home / "run"), "OMARCHY_THEME_HEADLESS": "1",
+               "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+               "PYTHONDONTWRITEBYTECODE": "", "PYTHONPYCACHEPREFIX": ""}
+        with patch.dict(os.environ, env), patch("theme_styles.__file__", str(plugin / "theme_styles.py")), \
+             patch("theme_styles.subprocess.Popen", side_effect=spawn):
+            try:
+                self.service.start("alpha", "Winter")
+                self.assertEqual(len(children), 1)
+                self.assertEqual(children[0].wait(timeout=10), 0)
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+        self.assertEqual(self.service.job("alpha")["error_code"], "unsupported")
+        self.assertEqual(list(plugin.rglob("*.pyc")), [])
+
+    def test_native_restore_without_original_wallpaper_retains_active_style(self):
+        job = self.saved_style()
+        self.service.apply("alpha", job["id"])
+        shutil.rmtree(self.service.themes / "alpha/backgrounds")
+        self.service.activate = lambda base, token="": Styles.activate(self.service, base, token)
+        with self.assertRaisesRegex(StylesError, "no usable wallpaper"):
+            self.service.delete("alpha", job["id"], confirmed=True)
+        self.assertEqual(self.service.context()["active"], job["id"])
+        self.assertTrue((self.service.current / "background").is_file())
+        self.assertTrue((self.service.root("alpha") / "variants" / job["id"]).is_dir())
+
     def test_native_omarchy_can_apply_and_restore_in_isolated_home(self):
         omarchy_path = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"))
         if not (omarchy_path / "bin/omarchy-theme-set").exists():
@@ -803,7 +969,7 @@ print("No image tool is configured")
         self.service.omarchy = omarchy_path
         job = self.request()
         self.complete(job)
-        self.service.activate = lambda slug: Styles.activate(self.service, slug)
+        self.service.activate = lambda slug, token="": Styles.activate(self.service, slug, token)
         self.service.render_templates = lambda: Styles.render_templates(self.service)
         runtime = self.home / "run"
         runtime.mkdir(exist_ok=True)
@@ -817,9 +983,9 @@ print("No image tool is configured")
                              (self.service.root("alpha") / "variants" / job["id"] / "theme/backgrounds/style.png").read_bytes())
             self.assertIn("#eeeeff", (self.service.current / "theme/kitty.conf").read_text())
             self.assertEqual(subprocess.check_output(["omarchy", "theme", "list"]), before_list)
-            self.service.activate("beta")
+            subprocess.run(["omarchy", "theme", "set", "beta"], check=True, capture_output=True)
             self.assertEqual(self.service.status()["styles"], [])
-            self.service.activate("alpha")
+            subprocess.run(["omarchy", "theme", "set", "alpha"], check=True, capture_output=True)
             self.assertEqual(self.service.context()["active"], "")
             self.assertEqual((self.service.current / "theme/colors.toml").read_text(), COLORS)
             self.assertEqual(len(self.service.status()["styles"]), 1)
