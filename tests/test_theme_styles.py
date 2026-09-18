@@ -51,7 +51,7 @@ class StylesTests(unittest.TestCase):
         self.service.render_templates = lambda: None
         self.service.headless = lambda: True
         # Unit tests don't require Codex to be installed.
-        self.which = patch("theme_styles.shutil.which", return_value="/tool")
+        self.which = patch("theme_styles.shutil.which", wraps=shutil.which)
         self.which.start()
         self.addCleanup(self.which.stop)
         catalog = patch.object(self.service.agents, "catalog", return_value=CATALOG)
@@ -456,8 +456,8 @@ class StylesTests(unittest.TestCase):
     def test_reported_tool_failure_is_not_mistaken_for_success(self):
         job = self.request(auto_apply=True)
         workspace = self.service.root("alpha") / "jobs" / job["id"]
-        png(workspace / "wallpaper.png")
-        write_json(workspace / "failure.json", {"error_code": "unsupported", "message": "untrusted secret"})
+        png(workspace / "agent/wallpaper.png")
+        write_json(workspace / "agent/failure.json", {"error_code": "unsupported", "message": "untrusted secret"})
         before = self.service.context()
         with patch.object(self.service, "run_process"), patch.object(self.service, "notify_failure") as notify:
             self.service.worker("alpha", job["id"])
@@ -496,7 +496,7 @@ print("No image tool is configured")
     def test_failed_process_reports_quota_without_claiming_unsupported(self):
         job = self.request()
         workspace = self.service.root("alpha") / "jobs" / job["id"]
-        write_json(workspace / "response.json", {"image_path": "", "error_code": "rate_limit"})
+        write_json(workspace / "agent/response.json", {"image_path": "", "error_code": "rate_limit"})
         with patch.object(self.service, "run_process", side_effect=StylesError("agent failed")):
             with self.assertRaises(GenerationError) as error:
                 self.service.generate_image(job, workspace)
@@ -507,7 +507,7 @@ print("No image tool is configured")
     def test_unknown_failure_preserves_log_and_does_not_claim_unsupported(self):
         job = self.request()
         workspace = self.service.root("alpha") / "jobs" / job["id"]
-        (workspace / "failure.json").write_text("malformed")
+        (workspace / "agent/failure.json").write_text("malformed")
         with patch.object(self.service, "run_process", side_effect=StylesError("agent failed")):
             with self.assertRaises(GenerationError) as error:
                 self.service.generate_image(job, workspace)
@@ -531,7 +531,7 @@ print("No image tool is configured")
     def test_invalid_image_is_a_failure(self):
         job = self.request()
         workspace = self.service.root("alpha") / "jobs" / job["id"]
-        (workspace / "wallpaper.png").write_text("This is not an image")
+        (workspace / "agent/wallpaper.png").write_text("This is not an image")
         with patch.object(self.service, "run_process"):
             with self.assertRaises(GenerationError) as error:
                 self.service.generate_image(job, workspace)
@@ -540,7 +540,7 @@ print("No image tool is configured")
     def test_valid_jpeg_named_png_is_normalized(self):
         job = self.request()
         workspace = self.service.root("alpha") / "jobs" / job["id"]
-        target = workspace / "wallpaper.png"
+        target = workspace / "agent/wallpaper.png"
         png(target)
         subprocess.run(["magick", str(target), "JPEG:" + str(target)], check=True)
         run_process = self.service.run_process
@@ -822,9 +822,10 @@ print("No image tool is configured")
         job = self.request("Another style")
         self.assertEqual(job["mode"], "light")
         workspace = self.service.root("alpha") / "jobs" / job["id"]
-        (workspace / "rendered").mkdir()
-        (workspace / "rendered/colors.toml").write_text(COLORS)
-        with patch.object(self.service, "run_process") as run:
+        def render_output(argv, *_args, **_kwargs):
+            output = Path(argv[argv.index("--output") + 1])
+            (output / "colors.toml").write_text(COLORS)
+        with patch.object(self.service, "run_process", side_effect=render_output) as run:
             _, mode = self.service.render(job, workspace, workspace / job["reference"])
         self.assertEqual(mode, "light")
         self.assertIn("--light-mode", run.call_args.args[0])
@@ -913,7 +914,7 @@ print("No image tool is configured")
         plugin = self.home / "plugin"
         plugin.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ("theme_styles.py", "agents.py", "theme-styles"):
+        for name in ("theme_styles.py", "agents.py", "security.py", "policy.xml", "theme-styles"):
             shutil.copyfile(source / name, plugin / name)
         binaries = self.home / "bin"
         binaries.mkdir()

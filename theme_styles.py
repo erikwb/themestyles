@@ -26,6 +26,8 @@ import time
 import tomllib
 import uuid
 from agents import Agents, HARNESS_NAMES
+from security import (agent_sandbox, sandbox, regular_file, private_directory,
+                      harden_tree, copy_output, convert_image)
 
 PLUGIN_ID = "io.weirdware.themestyles"
 # Recognize retained styles created before the plugin received its final ID.
@@ -70,7 +72,8 @@ def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+        with regular_file(temporary, write=True) as handle:
+            handle.write((json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -140,6 +143,7 @@ class Styles:
         self.omarchy = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"))
         data_home = Path(os.environ.get("XDG_DATA_HOME", self.home / ".local/share"))
         self.data = Path(data) if data else data_home / "omarchy-theme-styles"
+        private_directory(self.data)
         self.theme_lock = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-theme-set.lock"
         self.agents = Agents(self.home)
 
@@ -221,7 +225,7 @@ class Styles:
 
     def status(self):
         context = self.context()
-        missing = [name for name in ("aether", "magick", "omarchy") if not shutil.which(name)]
+        missing = [name for name in ("aether", "magick", "bwrap", "omarchy") if not shutil.which(name)]
         root = self.root(context["base"])
         return {"ok": True, **context, "styles": self.variants(context["base"]),
                 "job": self.job(context["base"]), "missing": missing,
@@ -264,8 +268,7 @@ class Styles:
                 shutil.copyfile(wallpaper, reference)
             write_json(staging / "original.json", {"base": context["base"], "wallpaper": reference.name,
                                                     "source": context["wallpaper"], "created_at": now()})
-            subprocess.run(["magick", str(reference), "-thumbnail", "640x360>", str(staging / "preview.jpg")],
-                           check=True, capture_output=True, timeout=30)
+            convert_image(reference, staging / "preview.jpg", thumbnail=True)
             staging.rename(original)
         finally:
             if staging.exists():
@@ -315,7 +318,7 @@ class Styles:
             raise StylesError("Enter a style description between 1 and 2,000 characters.")
         if not name or len(name) > 80 or any(ord(c) < 32 for c in name):
             raise StylesError("Give the saved style a name between 1 and 80 characters.")
-        missing = [x for x in ("aether", "magick") if not shutil.which(x)]
+        missing = [x for x in ("aether", "magick", "bwrap") if not shutil.which(x)]
         if missing:
             raise StylesError("Install the missing tools: " + ", ".join(missing))
         root = self.root(base)
@@ -347,7 +350,8 @@ class Styles:
             mode = self.original_mode(base)
             job_id = uuid.uuid4().hex
             workspace = root / "jobs" / job_id
-            workspace.mkdir(parents=True)
+            workspace.mkdir(parents=True, mode=0o700)
+            (workspace / "agent").mkdir(mode=0o700)
             try:
                 with lock(self.theme_lock, shared=True):
                     self.require_context(self._context(), base, context["token"])
@@ -368,7 +372,7 @@ class Styles:
             with lock(root / "job.lock"):
                 write_json(root / "job.json", job)
             if spawn:
-                with (workspace / "worker.log").open("a") as log_file:
+                with regular_file(workspace / "worker.log", write=True) as log_file:
                     process = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "worker", "--theme", base,
                                                 "--id", job_id], stdin=subprocess.DEVNULL, stdout=log_file,
                                                stderr=log_file, start_new_session=True)
@@ -397,12 +401,14 @@ class Styles:
         deadline = time.monotonic() + timeout
         # A regular file cannot block while a harness starts up without reading
         # stdin. A pipe write here would bypass both cancellation and timeout.
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as input_file, (workspace / log_name).open("w") as output:
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as input_file, \
+                regular_file(workspace / log_name, write=True) as output:
             if stdin is not None:
                 input_file.write(stdin)
                 input_file.seek(0)
             process = subprocess.Popen(argv, cwd=workspace, stdin=input_file if stdin is not None else subprocess.DEVNULL,
-                                       stdout=output, stderr=subprocess.STDOUT, text=True, start_new_session=True, env=env)
+                                       stdout=output, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                       env=env, umask=0o077)
             try:
                 while process.poll() is None:
                     if (workspace / "cancel").exists():
@@ -421,13 +427,21 @@ class Styles:
         schema = {"type": "object", "properties": {"image_path": {"type": "string"},
                   "error_code": {"type": "string", "enum": ["", "unsupported", "authentication", "rate_limit", "failed"]}},
                   "required": ["image_path", "error_code"], "additionalProperties": False}
-        write_json(workspace / "response-schema.json", schema)
+        agent = workspace / "agent"
+        private_directory(agent)
+        write_json(agent / "response-schema.json", schema)
+        reference = agent / job["reference"]
+        copy_output(workspace / job["reference"], reference)
         original = self.root(job["base"]) / "original/theme/colors.toml"
-        palette = original.read_text() if original.exists() else "Use the reference image's palette."
+        colors = tomllib.loads(original.read_text()) if original.exists() else {}
+        # Theme comments, arbitrary keys and non-color values are not instructions.
+        palette = json.dumps({key: value for key, value in colors.items()
+                              if re.fullmatch(r"background|foreground|accent|cursor|selection_[a-z]+|color\d{1,2}", key)
+                              and isinstance(value, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", value)})
         prompt = (
             "Create exactly one wallpaper variation using an image generation/editing tool available "
             "in this harness (built-in or already configured through MCP/extensions). "
-            f"The edit target is {workspace / job['reference']}. Inspect it and preserve its subject, composition, "
+            f"The edit target is {reference}. Inspect it and preserve its subject, composition, "
             "recognizable landmarks, aspect ratio, and artistic medium. Change the season, lighting, "
             "atmosphere or treatment according to the user's style. Do not add text, borders or UI. "
             "For abstract artwork, express the style through color, texture and lighting.\n\n"
@@ -437,19 +451,22 @@ class Styles:
             "delegate to another agent, browse for replacement images, or approximate the edit with image filters. "
             "If no image tool is available, stop immediately. If a tool fails, stop and report the failure; "
             "do not repeatedly retry. On failure, write JSON with error_code equal to unsupported, authentication, "
-            f"rate_limit, or failed to {workspace / 'failure.json'} if possible. Do not claim unsupported for "
+            f"rate_limit, or failed to {agent / 'failure.json'} if possible. Do not claim unsupported for "
             "temporary network or quota failures. "
-            f"Save/copy the generated image to {workspace / 'wallpaper.png'}. "
+            f"Save/copy the generated image to {agent / 'wallpaper.png'}. "
             "Do not modify any desktop settings or themes, or send messages to anyone. "
             "Return its absolute path in image_path and an empty error_code on success. "
             "On failure return an empty image_path and the error_code."
         )
-        (workspace / "prompt.txt").write_text(prompt)
+        with regular_file(agent / "prompt.txt", write=True) as handle:
+            handle.write(prompt.encode())
         selection = {key: job[key] for key in ("harness", "model", "thinking")}
-        argv = self.agents.command(selection, workspace, workspace / job["reference"])
+        argv = self.agents.command(selection, agent, reference)
+        argv, env = agent_sandbox(argv, self.home, agent,
+                                  [reference, agent / "prompt.txt", agent / "response-schema.json"], selection["harness"])
         try:
             self.run_process(argv, workspace, "agent.log", timeout=1200,
-                             stdin=prompt if self.agents.uses_stdin(selection["harness"]) else None)
+                             stdin=prompt if self.agents.uses_stdin(selection["harness"]) else None, env=env)
         except StylesError as exc:
             if (workspace / "cancel").exists() or "timed out" in str(exc):
                 raise
@@ -457,22 +474,21 @@ class Styles:
         reported = self.image_failure(job, workspace, reported_only=True)
         if reported:
             raise reported
-        output = workspace / "wallpaper.png"
-        if not output.is_file() or output.is_symlink():
+        output = agent / "wallpaper.png"
+        if not output.exists() and not output.is_symlink():
             raise self.image_failure(job, workspace)
-        result = subprocess.run(["magick", "identify", "-format", "%m %w %h", str(output)],
-                                capture_output=True, text=True, timeout=30)
-        parts = result.stdout.split()
-        if (result.returncode or len(parts) != 3 or parts[0] not in {"PNG", "JPEG", "WEBP", "BMP"}
-                or min(int(parts[1]), int(parts[2])) < 256):
-            raise GenerationError("The agent's output was not a usable wallpaper image.", "invalid_image")
-        if parts[0] != "PNG":
-            # Tools sometimes copy a JPEG/WebP to the requested .png filename.
-            # Validate the actual image and normalize it before Aether sees it.
-            normalized = workspace / "normalized.png"
-            self.run_process(["magick", str(output), str(normalized)], workspace, "image.log", timeout=30)
-            normalized.replace(output)
-        return output
+        try:
+            # The agent cannot mount or write this backend directory. Import a
+            # bounded regular inode, then decode and re-encode in an offline sandbox.
+            with tempfile.TemporaryDirectory(prefix=".import-", dir=workspace) as directory:
+                incoming = Path(directory) / "input"
+                copy_output(output, incoming)
+                normalized = Path(directory) / "wallpaper.png"
+                convert_image(incoming, normalized, log=workspace / "image.log")
+                normalized.replace(workspace / "wallpaper.png")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise GenerationError("The agent's output was not a usable wallpaper image. " + str(exc), "invalid_image") from exc
+        return workspace / "wallpaper.png"
 
     @staticmethod
     def image_failure(job, workspace, failed=False, reported_only=False):
@@ -484,11 +500,10 @@ class Styles:
             "failed": f"{harness} could not generate the wallpaper. Check its image tool or try another harness.",
         }
         for name in ("failure.json", "response.json"):
-            path = workspace / name
+            path = workspace / "agent" / name
             try:
-                if path.is_symlink() or path.stat().st_size > 65536:
-                    continue
-                report = read_json(path)
+                with regular_file(path, limit=65536) as handle:
+                    report = json.loads(handle.read(65537))
                 code = report.get("error_code") if isinstance(report, dict) else None
                 if code in reasons:
                     return GenerationError(reasons[code] + f" Details: {workspace / 'agent.log'}", code)
@@ -511,21 +526,34 @@ class Styles:
         return mode
 
     def render(self, job, workspace, image):
-        output = workspace / "rendered"
+        output = Path(tempfile.mkdtemp(prefix="rendered-", dir=workspace))
         mode = job["mode"]
         if mode not in {"light", "dark"}:
             mode = self.original_mode(job["base"])
         argv = ["aether", "--generate", str(image), "--no-apply", "--output", str(output)]
         if mode == "light":
             argv.append("--light-mode")
-        self.run_process(argv, workspace, "aether.log", timeout=120)
+        argv, env = sandbox(argv, Path("/aether-home"), output, readonly=[image], writable=[output])
+        self.run_process(argv, workspace, "aether.log", timeout=120, env=env)
         colors = output / "colors.toml"
         if not colors.is_file():
             raise StylesError("Aether did not produce colors.toml.")
-        palette = tomllib.loads(colors.read_text())
+        with regular_file(colors, limit=65536) as handle:
+            palette = tomllib.loads(handle.read(65537).decode())
         for key in ("background", "foreground", "accent"):
-            if not re.fullmatch(r"#[0-9a-fA-F]{6}", palette.get(key, "")):
+            if not isinstance(palette.get(key), str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", palette[key]):
                 raise StylesError(f"Aether returned an invalid {key} color.")
+        # Only literal color assignments cross back out of the Aether sandbox.
+        entries = {key: value for key, value in palette.items()
+                   if re.fullmatch(r"[a-z][a-z0-9_]{0,40}", key) and isinstance(value, str)
+                   and re.fullmatch(r"#[0-9a-fA-F]{6}", value)}
+        temporary = workspace / (".colors-" + uuid.uuid4().hex)
+        try:
+            with regular_file(temporary, write=True) as handle:
+                handle.write((f'mode = "{mode}"\n' + "".join(f'{key} = "{value}"\n' for key, value in entries.items())).encode())
+            temporary.replace(colors)
+        finally:
+            temporary.unlink(missing_ok=True)
         return output, mode
 
     def save_variant(self, job, workspace, image, rendered, mode):
@@ -550,8 +578,7 @@ class Styles:
             backgrounds = theme / "backgrounds"
             backgrounds.mkdir(exist_ok=True)
             shutil.copyfile(image, backgrounds / "style.png")
-            subprocess.run(["magick", str(image), "-thumbnail", "640x360>", str(staging / "preview.jpg")],
-                           capture_output=True, timeout=30, check=True)
+            convert_image(image, staging / "preview.jpg", thumbnail=True)
             record = {"id": job["id"], "base": job["base"], "name": job["name"], "style": job["style"],
                       "mode": mode, "created_at": now(), "provider": job.get("harness", "codex"),
                       "harness": job.get("harness", "codex"), "model": job.get("model", ""),
@@ -720,6 +747,7 @@ class Styles:
 
     def migrate(self):
         """Archive only our old companion themes; retain every saved variant."""
+        harden_tree(self.data)
         archived = []
         for destination in self.themes.glob("*-styles-*"):
             if destination.is_symlink() or not destination.is_dir():
@@ -844,6 +872,7 @@ class Styles:
 
 
 def main():
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description="Saved wallpaper styles for the current Omarchy theme")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="Current theme, saved styles and generation status (JSON)")
@@ -867,8 +896,8 @@ def main():
             sub.add_argument("--name", default="")
             sub.add_argument("--apply", action="store_true", help="Apply when complete only if the original selection is unchanged")
     args = parser.parse_args()
-    service = Styles()
     try:
+        service = Styles()
         if args.command == "status":
             result = service.status()
         elif args.command == "agents":

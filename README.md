@@ -8,8 +8,9 @@ and do not appear as separate entries in Omarchy's theme picker.
 ## Install
 
 Requires Omarchy Quattro (tested on 4.0.4), Python 3.11+, Aether, ImageMagick,
-and a signed-in agent. Install these separately; `python3`, `aether`, `magick`,
-and `omarchy` must be on your PATH. Desktop error notifications use `notify-send`.
+Bubblewrap with `--tmp-overlay` support, and a signed-in agent. Install these
+separately; `python3`, `aether`, `magick`, `bwrap`, and `omarchy` must be on your
+PATH. Desktop error notifications use `notify-send`.
 
 ```sh
 omarchy plugin add https://github.com/erikwb/themestyles --enable
@@ -65,7 +66,24 @@ Generation may use paid account credits.
 Styles, original snapshots, prompts, and logs live in
 `$XDG_DATA_HOME/omarchy-theme-styles`, normally `~/.local/share/omarchy-theme-styles`.
 Inspect logs before sharing them: they may contain prompts and agent output.
-Failed jobs are retained for troubleshooting.
+The store is restricted to your user. Failed jobs are retained for troubleshooting.
+
+Agents run in a Bubblewrap sandbox with a private home, temporary configuration
+for the selected harness, and a writable output folder. Your desktop sockets,
+unrelated home files, and saved themes are unavailable. The reference wallpaper
+and generation instructions are read-only. If the sandbox cannot start, generation
+fails; there is no unrestricted fallback.
+
+The agent still has network access and its configured provider credentials and
+MCP tools. The sandbox cannot restrict what a remote service does with those
+credentials. Tools needing other local files or desktop access may fail. Harness
+configuration changes and refreshed login tokens inside the sandbox are discarded;
+renew expired logins in the harness itself.
+
+Image decoding and Aether run in separate sandboxes without network access.
+Only PNG, JPEG, WebP, and BMP inputs are accepted, with byte, dimension, memory,
+disk, and time limits. Generated wallpapers are decoded and rewritten as PNG
+before they become saved styles.
 
 Each generation copies the active wallpaper before starting. If a saved style
 is active, it uses that style's original source instead of editing the generated
