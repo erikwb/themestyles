@@ -1,12 +1,12 @@
 """Exercise real local processes; no agent accounts or desktop state are used."""
 import os
-from pathlib import Path
 import signal
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 from theme_styles import Styles, StylesError
 

@@ -1,115 +1,29 @@
 """Behavior tests use an isolated home; no desktop or paid generation is touched."""
-import os
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import fcntl
-from pathlib import Path
+import os
 import shutil
-import struct
 import subprocess
-import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from pathlib import Path
 from unittest.mock import patch
-import zlib
 
-from theme_styles import MARKER, Styles, StylesError, GenerationError, read_json, write_json
-from agents import Agents, HARNESS_NAMES, DEFAULT_MODEL, model
+from support import CATALOG, COLORS, StyleFixture, png
 
-
-CATALOG = [Agents.entry("codex", "Codex", [model("image-agent", "Image Agent", ["low", "high"], "low")],
-                       "image-agent", "high"),
-           Agents.entry("grok", "Grok", [model("grok-image", "Grok Image", ["low", "high"], "high")],
-                        "grok-image", "")]
-
-
-COLORS = 'mode = "dark"\nbackground = "#121822"\nforeground = "#eeeeff"\naccent = "#88aaff"\n'
-
-
-def png(path, color=(30, 60, 90)):
-    def chunk(kind, data):
-        return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data))
-    pixels = b"".join(b"\x00" + bytes((c + x // 4 + y // 4) % 256
-                      for x in range(320) for c in color) for y in range(256))
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!IIBBBBB", 320, 256, 8, 2, 0, 0, 0))
-                     + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
+from agents import DEFAULT_MODEL, HARNESS_NAMES
+from desktop import OmarchyDesktop
+from theme_styles import (
+    MARKER,
+    GenerationError,
+    StylesError,
+    read_json,
+    write_json,
+)
 
 
-class StylesTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
-        self.service = Styles(home=self.home, data=self.home / "data")
-        self.service.theme_lock = self.home / "run/theme.lock"
-        self.service.omarchy = self.home / "omarchy"
-        self.service.current.mkdir(parents=True)
-        self.make_theme("alpha")
-        self.make_theme("beta")
-        self.select("alpha")
-        self.calls = []
-        self.service.activate = self.select
-        self.service.render_templates = lambda: None
-        self.service.headless = lambda: True
-        # Unit tests don't require Codex to be installed.
-        self.which = patch("theme_styles.shutil.which", wraps=shutil.which)
-        self.which.start()
-        self.addCleanup(self.which.stop)
-        catalog = patch.object(self.service.agents, "catalog", return_value=CATALOG)
-        catalog.start()
-        self.addCleanup(catalog.stop)
-        binary = patch("agents.safe_binary", return_value="/tool")
-        binary.start()
-        self.addCleanup(binary.stop)
-
-    def make_theme(self, name):
-        root = self.service.themes / name
-        (root / "backgrounds").mkdir(parents=True)
-        png(root / "backgrounds/original.png")
-        (root / "colors.toml").write_text(COLORS)
-        (root / "kitty.conf").write_text("old colors\n")
-        (root / "extra.asset").write_text("keep this\n")
-
-    def select(self, slug, token=""):
-        if hasattr(self, "calls"):
-            self.calls.append(slug)
-        current = self.service.current
-        if (current / "theme").exists():
-            shutil.rmtree(current / "theme")
-        shutil.copytree(self.service.themes / slug, current / "theme")
-        (current / "theme.name").write_text(slug)
-        (current / "background").unlink(missing_ok=True)
-        (current / "background").symlink_to(next((current / "theme/backgrounds").iterdir()))
-
-    def select_wallpaper(self, path):
-        link = self.service.current / "background"
-        link.unlink(missing_ok=True)
-        link.symlink_to(path)
-
-    def request(self, name="Winter", auto_apply=False):
-        return self.service.start("alpha", "Snow and twilight", name, auto_apply=auto_apply, spawn=False)["job"]
-
-    def complete(self, job):
-        workspace = self.service.root(job["base"]) / "jobs" / job["id"]
-        image = workspace / "wallpaper.png"
-        png(image, (10, 20, 220))
-        rendered = workspace / "rendered"
-        rendered.mkdir()
-        (rendered / "colors.toml").write_text(COLORS.replace("#88aaff", "#55bbcc"))
-        return self.service.save_variant(job, workspace, image, rendered, "dark")
-
-    def fake_pipeline(self):
-        def image(job, workspace):
-            target = workspace / "wallpaper.png"
-            png(target)
-            return target
-        def render(job, workspace, image):
-            target = workspace / "rendered"
-            target.mkdir()
-            (target / "colors.toml").write_text(COLORS)
-            return target, "dark"
-        self.service.generate_image = image
-        self.service.render = render
-
+class StylesTests(StyleFixture, unittest.TestCase):
     def test_saved_styles_are_visible_only_for_current_parent(self):
         job = self.request()
         self.complete(job)
@@ -218,7 +132,7 @@ class StylesTests(unittest.TestCase):
         self.assertEqual(job["style"], "Winter\nwith\tsnow")
 
     def test_applying_style_retains_parent_and_original_theme(self):
-        original = (self.service.themes / "alpha/colors.toml").read_bytes()
+        original = (self.service.desktop.themes / "alpha/colors.toml").read_bytes()
         job = self.request()
         self.complete(job)
         self.service.apply("alpha", job["id"])
@@ -227,8 +141,8 @@ class StylesTests(unittest.TestCase):
         self.assertEqual(state["name"], "alpha")
         self.assertEqual(state["active"], job["id"])
         self.assertEqual(len(state["styles"]), 1)
-        self.assertEqual((self.service.themes / "alpha/colors.toml").read_bytes(), original)
-        self.assertEqual({p.name for p in self.service.themes.iterdir()}, {"alpha", "beta"})
+        self.assertEqual((self.service.desktop.themes / "alpha/colors.toml").read_bytes(), original)
+        self.assertEqual({p.name for p in self.service.desktop.themes.iterdir()}, {"alpha", "beta"})
         self.service.restore("alpha")
         self.assertEqual(self.service.status()["active"], "")
 
@@ -242,11 +156,11 @@ class StylesTests(unittest.TestCase):
         reference = root / "jobs" / second["id"] / second["reference"]
         original = root / "original/wallpaper.png"
         self.assertEqual(reference.read_bytes(), original.read_bytes())
-        self.assertNotEqual(reference.read_bytes(), (self.service.current / "background").read_bytes())
+        self.assertNotEqual(reference.read_bytes(), (self.service.desktop.current / "background").read_bytes())
 
     def test_first_generation_uses_selected_wallpaper_not_first_in_theme(self):
-        default = (self.service.current / "background").read_bytes()
-        selected = self.service.current / "theme/backgrounds/second.png"
+        default = (self.service.desktop.current / "background").read_bytes()
+        selected = self.service.desktop.current / "theme/backgrounds/second.png"
         png(selected, (100, 10, 30))
         self.select_wallpaper(selected)
         job = self.request()
@@ -259,7 +173,7 @@ class StylesTests(unittest.TestCase):
         self.service.update_job("alpha", state="done")
         root = self.service.root("alpha")
         original = (root / "original/wallpaper.png").read_bytes()
-        selected = self.service.current / "theme/backgrounds/second.png"
+        selected = self.service.desktop.current / "theme/backgrounds/second.png"
         png(selected, (100, 10, 30))
         self.select_wallpaper(selected)
         job = self.request("Summer")
@@ -271,7 +185,7 @@ class StylesTests(unittest.TestCase):
     def test_saved_style_keeps_its_own_source_after_job_cleanup(self):
         self.request()
         self.service.update_job("alpha", state="done")
-        selected = self.service.current / "theme/backgrounds/second.png"
+        selected = self.service.desktop.current / "theme/backgrounds/second.png"
         png(selected, (100, 10, 30))
         source = selected.read_bytes()
         self.select_wallpaper(selected)
@@ -285,7 +199,7 @@ class StylesTests(unittest.TestCase):
         reference = root / "jobs" / third["id"] / third["reference"]
         self.assertEqual(reference.read_bytes(), source)
         self.assertNotEqual(reference.read_bytes(), (root / "original/wallpaper.png").read_bytes())
-        self.assertNotEqual(reference.read_bytes(), (self.service.current / "background").read_bytes())
+        self.assertNotEqual(reference.read_bytes(), (self.service.desktop.current / "background").read_bytes())
 
     def test_native_wallpaper_change_over_active_style_takes_precedence(self):
         first = self.request()
@@ -330,7 +244,7 @@ class StylesTests(unittest.TestCase):
         root = self.service.root("alpha")
         reference = root / "jobs" / job["id"] / job["reference"]
         frozen = reference.read_bytes()
-        selected = self.service.current / "theme/backgrounds/second.png"
+        selected = self.service.desktop.current / "theme/backgrounds/second.png"
         png(selected, (100, 10, 30))
         self.select_wallpaper(selected)
         self.fake_pipeline()
@@ -344,7 +258,7 @@ class StylesTests(unittest.TestCase):
     def test_wallpaper_change_while_copying_reference_rejects_request(self):
         self.request()
         self.service.update_job("alpha", state="done")
-        selected = self.service.current / "theme/backgrounds/second.png"
+        selected = self.service.desktop.current / "theme/backgrounds/second.png"
         png(selected, (100, 10, 30))
         original_copy = shutil.copyfile
         def copy_and_switch(source, destination, *args, **kwargs):
@@ -364,7 +278,7 @@ class StylesTests(unittest.TestCase):
         self.select("beta")
         with self.assertRaisesRegex(StylesError, "selected theme changed"):
             self.service.apply("alpha", job["id"])
-        self.assertFalse((self.service.themes / self.service.slot("alpha")).exists())
+        self.assertFalse((self.service.desktop.themes / self.service.slot("alpha")).exists())
         with self.assertRaisesRegex(StylesError, "does not belong"):
             self.service.apply("beta", job["id"])
         self.assertEqual(self.service.context()["name"], "beta")
@@ -552,7 +466,7 @@ print("No image tool is configured")
         self.assertEqual(output.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
     def test_notification_escapes_markup_and_does_not_use_shell(self):
-        self.service.headless = lambda: False
+        self.service.desktop.headless = lambda: False
         with patch("theme_styles.subprocess.run") as run:
             self.service.notify_failure("<b>Image failed</b> $(command)")
         argv = run.call_args.args[0]
@@ -602,7 +516,7 @@ print("No image tool is configured")
     def test_existing_unmanaged_companion_is_ignored(self):
         job = self.request()
         self.complete(job)
-        destination = self.service.themes / self.service.slot("alpha")
+        destination = self.service.desktop.themes / self.service.slot("alpha")
         destination.mkdir()
         (destination / "precious").write_text("untouched")
         self.service.apply("alpha", job["id"])
@@ -616,30 +530,30 @@ print("No image tool is configured")
         self.service.update_job("alpha", state="done")
         second = self.request("Winter 2")
         self.complete(second)
-        background = (self.service.current / "background").readlink()
-        with patch.object(self.service, "render_templates", side_effect=StylesError("apply failed")):
+        background = (self.service.desktop.current / "background").readlink()
+        with patch.object(self.service.desktop, "render_templates", side_effect=StylesError("apply failed")):
             with self.assertRaisesRegex(StylesError, "apply failed"):
                 self.service.apply("alpha", second["id"])
-        marker = read_json(self.service.current / "theme" / MARKER)
+        marker = read_json(self.service.desktop.current / "theme" / MARKER)
         self.assertEqual(marker["style_id"], first["id"])
-        self.assertEqual((self.service.current / "background").readlink(), background)
-        self.assertFalse((self.service.current / "next-theme").exists())
+        self.assertEqual((self.service.desktop.current / "background").readlink(), background)
+        self.assertFalse((self.service.desktop.current / "next-theme").exists())
 
     def test_partial_activation_failure_recovers_runtime(self):
         job = self.request()
         self.complete(job)
         previous = self.service.context()
         def fail_after_switch(base, wallpaper):
-            Styles.update_selection(self.service, base, wallpaper)
+            OmarchyDesktop.update_selection(self.service.desktop, base, wallpaper)
             raise StylesError("refresh failed")
-        self.service.update_selection = fail_after_switch
+        self.service.desktop.update_selection = fail_after_switch
         with self.assertRaisesRegex(StylesError, "refresh failed"):
             self.service.apply("alpha", job["id"])
         self.assertEqual(self.service.context()["name"], "alpha")
         self.assertEqual(self.service.context()["active"], "")
         self.assertEqual(self.service.context()["wallpaper"], previous["wallpaper"])
-        self.assertEqual((self.service.current / "theme/colors.toml").read_text(), COLORS)
-        self.assertFalse((self.service.themes / self.service.slot("alpha")).exists())
+        self.assertEqual((self.service.desktop.current / "theme/colors.toml").read_text(), COLORS)
+        self.assertFalse((self.service.desktop.themes / self.service.slot("alpha")).exists())
 
     def test_reselecting_original_clears_style_but_retains_saved_versions(self):
         job = self.request()
@@ -652,21 +566,21 @@ print("No image tool is configured")
         self.assertEqual(state["name"], "alpha")
         self.assertEqual(state["active"], "")
         self.assertEqual(state["styles"][0]["id"], job["id"])
-        self.assertEqual((self.service.current / "theme/colors.toml").read_text(), COLORS)
+        self.assertEqual((self.service.desktop.current / "theme/colors.toml").read_text(), COLORS)
 
     def test_migration_archives_legacy_theme_and_preserves_active_style(self):
         job = self.request()
         self.complete(job)
-        legacy = self.service.themes / self.service.slot("alpha")
+        legacy = self.service.desktop.themes / self.service.slot("alpha")
         shutil.copytree(self.service.root("alpha") / "variants" / job["id"] / "theme", legacy)
         self.select(legacy.name)
-        before = (self.service.current / "background").read_bytes()
+        before = (self.service.desktop.current / "background").read_bytes()
         result = self.service.migrate()
         self.assertEqual(result["archived"], [legacy.name])
         self.assertFalse(legacy.exists())
         self.assertEqual(self.service.context()["name"], "alpha")
         self.assertEqual(self.service.context()["active"], job["id"])
-        self.assertEqual((self.service.current / "background").read_bytes(), before)
+        self.assertEqual((self.service.desktop.current / "background").read_bytes(), before)
         self.assertEqual(len(self.service.variants("alpha")), 1)
         archives = list((self.service.root("alpha") / "legacy-themes").iterdir())
         self.assertEqual(len(archives), 1)
@@ -676,7 +590,7 @@ print("No image tool is configured")
     def test_migration_of_inactive_legacy_theme_does_not_change_selection(self):
         job = self.request()
         self.complete(job)
-        legacy = self.service.themes / self.service.slot("alpha")
+        legacy = self.service.desktop.themes / self.service.slot("alpha")
         shutil.copytree(self.service.root("alpha") / "variants" / job["id"] / "theme", legacy)
         self.select("beta")
         before = self.service.context()
@@ -687,7 +601,7 @@ print("No image tool is configured")
     def test_existing_native_staging_is_not_overwritten(self):
         job = self.request()
         self.complete(job)
-        staging = self.service.current / "next-theme"
+        staging = self.service.desktop.current / "next-theme"
         staging.mkdir()
         (staging / "precious").write_text("pending")
         with self.assertRaisesRegex(StylesError, "unfinished theme change"):
@@ -710,7 +624,7 @@ print("No image tool is configured")
     def test_deletion_removes_only_selected_style_and_its_generation_files(self):
         first = self.saved_style()
         second = self.saved_style("Summer")
-        original = (self.service.themes / "alpha/colors.toml").read_bytes()
+        original = (self.service.desktop.themes / "alpha/colors.toml").read_bytes()
         root = self.service.root("alpha")
         self.service.delete("alpha", first["id"], confirmed=True)
         self.assertEqual([v["id"] for v in self.service.variants("alpha")], [second["id"]])
@@ -718,7 +632,7 @@ print("No image tool is configured")
         self.assertTrue((root / "jobs" / second["id"]).exists())
         self.assertTrue((root / "original/wallpaper.png").is_file())
         self.assertEqual(self.service.job("alpha")["id"], second["id"])
-        self.assertEqual((self.service.themes / "alpha/colors.toml").read_bytes(), original)
+        self.assertEqual((self.service.desktop.themes / "alpha/colors.toml").read_bytes(), original)
         self.assertEqual(self.calls, [])
 
     def test_deleting_active_style_restores_original_and_clears_job(self):
@@ -730,17 +644,17 @@ print("No image tool is configured")
         self.assertEqual(state["active"], "")
         self.assertEqual(state["styles"], [])
         self.assertEqual(state["job"], {})
-        self.assertTrue((self.service.current / "background").is_file())
-        self.assertEqual((self.service.current / "theme/colors.toml").read_text(), COLORS)
+        self.assertTrue((self.service.desktop.current / "background").is_file())
+        self.assertEqual((self.service.desktop.current / "theme/colors.toml").read_text(), COLORS)
 
     def test_failed_restore_prevents_active_style_deletion(self):
         job = self.saved_style()
         self.service.apply("alpha", job["id"])
-        with patch.object(self.service, "activate", side_effect=StylesError("restore failed")):
+        with patch.object(self.service.desktop, "activate", side_effect=StylesError("restore failed")):
             with self.assertRaisesRegex(StylesError, "restore failed"):
                 self.service.delete("alpha", job["id"], confirmed=True)
         self.assertEqual(self.service.context()["active"], job["id"])
-        self.assertTrue((self.service.current / "background").is_file())
+        self.assertTrue((self.service.desktop.current / "background").is_file())
         self.assertEqual(len(self.service.variants("alpha")), 1)
 
     def test_stale_confirmation_and_cross_theme_deletion_are_rejected(self):
@@ -776,7 +690,7 @@ print("No image tool is configured")
         self.assertTrue((moved / "style.json").is_file())
 
     def test_native_templates_replace_old_colors_and_extras_survive(self):
-        templates = self.service.omarchy / "default/themed"
+        templates = self.service.desktop.omarchy / "default/themed"
         templates.mkdir(parents=True)
         (templates / "kitty.conf.tpl").write_text("foreground {{ foreground }}")
         job = self.request()
@@ -835,13 +749,13 @@ print("No image tool is configured")
         self.service.apply("alpha", job["id"])
         def switch_before_activate(base, token):
             self.select("beta")
-            Styles.activate(self.service, base, token)
+            OmarchyDesktop.activate(self.service.desktop, base, token)
         for deleting in (False, True):
             with self.subTest(deleting=deleting):
                 self.select("alpha")
                 self.service.apply("alpha", job["id"])
                 token = self.service.context()["token"]
-                with patch.object(self.service, "activate", side_effect=switch_before_activate):
+                with patch.object(self.service.desktop, "activate", side_effect=switch_before_activate):
                     with self.assertRaisesRegex(StylesError, "selected theme changed"):
                         if deleting:
                             self.service.delete("alpha", job["id"], token, confirmed=True)
@@ -855,16 +769,16 @@ print("No image tool is configured")
         self.service.apply("alpha", job["id"])
         previous = self.service.context()
         def failed_setter(argv, workspace, log, **kwargs):
-            with self.service.theme_lock.open("a") as handle:
+            with self.service.desktop.theme_lock.open("a") as handle:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertEqual(kwargs["env"]["OMARCHY_THEME_HEADLESS"], "1")
-            self.assertNotEqual(Path(kwargs["env"]["XDG_RUNTIME_DIR"]), self.service.theme_lock.parent)
+            self.assertNotEqual(Path(kwargs["env"]["XDG_RUNTIME_DIR"]), self.service.desktop.theme_lock.parent)
             self.select("alpha")
             raise StylesError("Native setter failed after changing files")
-        with patch.object(self.service, "run_process", side_effect=failed_setter):
+        with patch.object(self.service.desktop, "run_process", side_effect=failed_setter):
             with self.assertRaisesRegex(StylesError, "Native setter failed"):
-                Styles.activate(self.service, "alpha", previous["token"])
+                OmarchyDesktop.activate(self.service.desktop, "alpha", previous["token"])
         restored = self.service.context()
         self.assertEqual((restored["base"], restored["active"], restored["wallpaper"]),
                          (previous["base"], previous["active"], previous["wallpaper"]))
@@ -881,7 +795,7 @@ print("No image tool is configured")
                 if not release.wait(3):
                     raise RuntimeError("Test worker was not released")
             return value
-        with patch("theme_styles.read_json", side_effect=paused_read), \
+        with patch("storage.read_json", side_effect=paused_read), \
              ThreadPoolExecutor(max_workers=1, thread_name_prefix="worker") as workers, \
              ThreadPoolExecutor(max_workers=1, thread_name_prefix="cancel") as cancellers:
             worker = workers.submit(self.service.update_job, "alpha", expected_id=job["id"], state="theming")
@@ -914,7 +828,7 @@ print("No image tool is configured")
         plugin = self.home / "plugin"
         plugin.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ("theme_styles.py", "agents.py", "security.py", "policy.xml", "theme-styles"):
+        for name in ("theme_styles.py", "agents.py", "harnesses.py", "security.py", "policy.xml", "files.py", "errors.py", "processes.py", "storage.py", "desktop.py", "theme-styles"):
             shutil.copyfile(source / name, plugin / name)
         binaries = self.home / "bin"
         binaries.mkdir()
@@ -926,7 +840,7 @@ sys.stdin.read()
 Path("failure.json").write_text('{"error_code": "unsupported"}')
 ''')
         agent.chmod(0o755)
-        self.service.data = self.home / "omarchy-theme-styles"
+        self.service.store.data = self.home / "omarchy-theme-styles"
         children = []
         popen = subprocess.Popen
         def spawn(argv, **kwargs):
@@ -955,23 +869,23 @@ Path("failure.json").write_text('{"error_code": "unsupported"}')
     def test_native_restore_without_original_wallpaper_retains_active_style(self):
         job = self.saved_style()
         self.service.apply("alpha", job["id"])
-        shutil.rmtree(self.service.themes / "alpha/backgrounds")
-        self.service.activate = lambda base, token="": Styles.activate(self.service, base, token)
+        shutil.rmtree(self.service.desktop.themes / "alpha/backgrounds")
+        self.service.desktop.activate = lambda base, token="": OmarchyDesktop.activate(self.service.desktop, base, token)
         with self.assertRaisesRegex(StylesError, "no usable wallpaper"):
             self.service.delete("alpha", job["id"], confirmed=True)
         self.assertEqual(self.service.context()["active"], job["id"])
-        self.assertTrue((self.service.current / "background").is_file())
+        self.assertTrue((self.service.desktop.current / "background").is_file())
         self.assertTrue((self.service.root("alpha") / "variants" / job["id"]).is_dir())
 
     def test_native_omarchy_can_apply_and_restore_in_isolated_home(self):
         omarchy_path = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"))
         if not (omarchy_path / "bin/omarchy-theme-set").exists():
             self.skipTest("Omarchy is not installed")
-        self.service.omarchy = omarchy_path
+        self.service.desktop.omarchy = omarchy_path
         job = self.request()
         self.complete(job)
-        self.service.activate = lambda slug, token="": Styles.activate(self.service, slug, token)
-        self.service.render_templates = lambda: Styles.render_templates(self.service)
+        self.service.desktop.activate = lambda slug, token="": OmarchyDesktop.activate(self.service.desktop, slug, token)
+        self.service.desktop.render_templates = lambda: OmarchyDesktop.render_templates(self.service.desktop)
         runtime = self.home / "run"
         runtime.mkdir(exist_ok=True)
         with patch.dict(os.environ, {"HOME": str(self.home), "OMARCHY_THEME_HEADLESS": "1",
@@ -980,15 +894,15 @@ Path("failure.json").write_text('{"error_code": "unsupported"}')
             self.service.apply("alpha", job["id"])
             self.assertEqual(self.service.context()["name"], "alpha")
             self.assertEqual(self.service.context()["active"], job["id"])
-            self.assertEqual((self.service.current / "background").read_bytes(),
+            self.assertEqual((self.service.desktop.current / "background").read_bytes(),
                              (self.service.root("alpha") / "variants" / job["id"] / "theme/backgrounds/style.png").read_bytes())
-            self.assertIn("#eeeeff", (self.service.current / "theme/kitty.conf").read_text())
+            self.assertIn("#eeeeff", (self.service.desktop.current / "theme/kitty.conf").read_text())
             self.assertEqual(subprocess.check_output(["omarchy", "theme", "list"]), before_list)
             subprocess.run(["omarchy", "theme", "set", "beta"], check=True, capture_output=True)
             self.assertEqual(self.service.status()["styles"], [])
             subprocess.run(["omarchy", "theme", "set", "alpha"], check=True, capture_output=True)
             self.assertEqual(self.service.context()["active"], "")
-            self.assertEqual((self.service.current / "theme/colors.toml").read_text(), COLORS)
+            self.assertEqual((self.service.desktop.current / "theme/colors.toml").read_text(), COLORS)
             self.assertEqual(len(self.service.status()["styles"]), 1)
             self.service.apply("alpha", job["id"])
             self.service.restore("alpha")
@@ -998,7 +912,7 @@ Path("failure.json").write_text('{"error_code": "unsupported"}')
             self.service.delete("alpha", job["id"], confirmed=True)
             self.assertEqual(self.service.status()["styles"], [])
             self.assertEqual(self.service.context()["active"], "")
-            self.assertTrue((self.service.current / "background").is_file())
+            self.assertTrue((self.service.desktop.current / "background").is_file())
 
     def test_pathlike_style_names_are_labels_never_paths(self):
         job = self.request("../../summer; $(touch nope)")

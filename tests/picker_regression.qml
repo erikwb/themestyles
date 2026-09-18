@@ -81,6 +81,15 @@ Scope {
         check([harness.value, models.value, thinking.value], ["", "", ""], "Theme change clears displayed values")
         check(models.filtered, [], "Empty model menu after theme change")
         check(thinking.options, [], "Empty thinking menu after theme change")
+        panel.state = {base: "fixture", token: "fixture"}
+        panel.receiveAgents({ok: true, base: "fixture", agents: [], selection: {},
+          diagnostics: [{label: "Pi", code: "discovery_failed", message: "Account data could not be read."}]})
+        check(panel.agentDiagnostics.length, 1, "Discovery failure remains visible")
+        panel.receiveAgents({ok: true, base: "old-theme", agents: [], selection: {}, diagnostics: []})
+        check(panel.agentDiagnostics.length, 1, "Stale discovery reply is ignored")
+        panel.receiveAgents({ok: false, error: "Discovery failed"})
+        check(panel.message, "Discovery failed", "Backend discovery errors are shown")
+        check(panel.agentsTheme, "", "Failed discovery invalidates readiness")
         console.log("PICKER REGRESSION PASSED")
       } catch (error) {
         console.error("PICKER REGRESSION FAILED: " + error)

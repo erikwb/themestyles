@@ -1,11 +1,10 @@
 """Exercise the actual plugin and native dropdowns in an invisible test shell."""
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
 SHELL = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "shell"

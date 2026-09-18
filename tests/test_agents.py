@@ -1,14 +1,21 @@
 """Discovery uses synthetic auth responses: never calls a live model."""
 import json
 import os
-from contextlib import closing
-from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from pathlib import Path
 from unittest.mock import patch
 
-from agents import Agents, AgentError, DEFAULT_MODEL, HARNESS_NAMES, copilot_metadata, model, safe_binary
+from agents import (
+    DEFAULT_MODEL,
+    HARNESS_NAMES,
+    AgentError,
+    Agents,
+    model,
+    safe_binary,
+)
 
 
 class AgentTests(unittest.TestCase):

@@ -1,242 +1,101 @@
-"""Theme-scoped wallpaper generation and native Omarchy theme activation.
-
-Only the worker invokes an agent. Listing and switching saved styles are local.
-Agent output is an image; Aether and Omarchy own all theme configuration.
-"""
+"""Theme-style generation and CLI orchestration."""
 from __future__ import annotations
 
 import argparse
-import base64
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from datetime import datetime, timezone
-import fcntl
-import hashlib
 import html
 import json
 import os
-from pathlib import Path
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import uuid
-from agents import Agents, HARNESS_NAMES
-from security import (agent_sandbox, sandbox, regular_file, private_directory,
-                      harden_tree, copy_output, convert_image)
+from pathlib import Path
 
-PLUGIN_ID = "io.weirdware.themestyles"
-# Recognize retained styles created before the plugin received its final ID.
-STYLE_OWNERS = {PLUGIN_ID, "io.github.erikwb.theme-styles"}
-MARKER = "theme-styles.json"
-ACTIVE_STATES = {"starting", "generating", "theming", "saving", "applying"}
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-# The same app refresh helpers used by Omarchy's theme setter. Missing helpers
-# on older releases are skipped; theme source directories are never changed.
-REFRESH_COMMANDS = (
-    "omarchy-restart-terminal", "omarchy-restart-hyprctl", "omarchy-restart-btop",
-    "omarchy-restart-opencode", "omarchy-restart-helix",
-    *(f"omarchy-theme-set-{app}" for app in (
-        "foot", "tmux", "gnome", "pi", "claude", "hermes", "t3code", "browser",
-        "vscode", "obsidian", "keyboard")),
+import tomllib
+
+from agents import HARNESS_NAMES, Agents
+from desktop import OmarchyDesktop
+from errors import GenerationError, ProcessCancelled, ProcessTimedOut, StylesError
+from files import (
+    lock,
+    private_directory,
+    read_json,
+    regular_file,
+    validate_id,
+    write_json,
 )
-
-
-class StylesError(Exception):
-    pass
-
-
-class GenerationError(StylesError):
-    def __init__(self, message, code="generation_failed"):
-        super().__init__(message)
-        self.code = code
-
-
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def read_json(path, default=None):
-    try:
-        return json.loads(Path(path).read_text())
-    except FileNotFoundError:
-        return default
-
-
-def write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with regular_file(temporary, write=True) as handle:
-            handle.write((json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def validate_slug(value):
-    if not value or value.startswith(".") or "/" in value or "\\" in value or any(ord(c) < 32 for c in value):
-        raise StylesError("Invalid theme identifier.")
-    return value
-
-
-def validate_id(value):
-    if not re.fullmatch(r"[a-f0-9]{32}", value):
-        raise StylesError("Invalid saved style identifier.")
-    return value
-
-
-@contextmanager
-def lock(path, *, shared=False, blocking=True):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as handle:
-        flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
-        try:
-            fcntl.flock(handle, flags | (0 if blocking else fcntl.LOCK_NB))
-        except BlockingIOError as exc:
-            raise StylesError("A style operation is already running. Try again shortly.") from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def process_start(pid):
-    try:
-        # Everything after the final ')' starts at proc stat field 3.
-        return Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[19]
-    except (OSError, ValueError, IndexError):
-        return ""
-
-
-def stop_process_group(process):
-    """Reap the harness and terminate its remaining tools, even if it exited."""
-    def send(sig):
-        try:
-            os.killpg(process.pid, sig)
-            return True
-        except ProcessLookupError:
-            return False
-
-    if send(signal.SIGTERM):
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            process.poll()
-            if not send(0):
-                break
-            time.sleep(0.05)
-        # Waiting only for the parent misses tools which ignore SIGTERM.
-        send(signal.SIGKILL)
-    process.wait()
+from processes import process_start, run
+from security import agent_sandbox, convert_image, copy_output, sandbox
+from storage import ACTIVE_STATES, IMAGE_SUFFIXES, MARKER, StyleStore, now
 
 
 class Styles:
     def __init__(self, home=None, data=None):
         self.home = Path(home) if home else Path.home()
-        self.current = self.home / ".local/state/omarchy/current"
-        self.themes = self.home / ".config/omarchy/themes"
-        self.omarchy = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"))
         data_home = Path(os.environ.get("XDG_DATA_HOME", self.home / ".local/share"))
-        self.data = Path(data) if data else data_home / "omarchy-theme-styles"
-        private_directory(self.data)
-        self.theme_lock = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-theme-set.lock"
+        self.store = StyleStore(Path(data) if data else data_home / "omarchy-theme-styles")
+        self.desktop = OmarchyDesktop(self.home, self.store)
         self.agents = Agents(self.home)
 
     def root(self, base):
-        validate_slug(base)
-        key = hashlib.sha256(base.encode()).hexdigest()[:24]
-        return self.data / "themes" / key
+        return self.store.root(base)
 
     def slot(self, base):
-        prefix = re.sub(r"[^a-z0-9-]", "-", base.lower()).strip("-")[:48] or "theme"
-        return f"{prefix}-styles-{hashlib.sha256(base.encode()).hexdigest()[:8]}"
-
-    def context(self):
-        """Read the name, marker and wallpaper from one Omarchy transition."""
-        with lock(self.theme_lock, shared=True):
-            return self._context()
-
-    def _context(self):
-        try:
-            name = validate_slug((self.current / "theme.name").read_text().strip())
-        except FileNotFoundError as exc:
-            raise StylesError("No current Omarchy theme was found.") from exc
-        marker = read_json(self.current / "theme" / MARKER, {})
-        base, active = name, ""
-        if marker.get("plugin") in STYLE_OWNERS:
-            candidate = validate_slug(marker.get("base", ""))
-            if name in {candidate, self.slot(candidate)}:
-                base, active = candidate, marker.get("style_id", "")
-        try:
-            wallpaper = (self.current / "background").resolve(strict=True)
-        except OSError:
-            wallpaper = None
-        # A switch away and back also invalidates a pending auto-apply.
-        parts = [name]
-        for path in [self.current / "theme.name", self.current / "background", self.current / "theme/colors.toml"]:
-            try:
-                st = path.lstat()
-                parts.extend([str(st.st_ino), str(st.st_mtime_ns)])
-            except OSError:
-                parts.append("missing")
-        return {"base": base, "name": name, "display_name": base.replace("-", " ").title(),
-                "active": active, "wallpaper": str(wallpaper) if wallpaper else "",
-                "token": hashlib.sha256("|".join(parts).encode()).hexdigest()}
-
-    def check_context(self, base, token=""):
-        context = self.context()
-        return self.require_context(context, base, token)
-
-    def require_context(self, context, base, token=""):
-        if context["base"] != base or (token and context["token"] != token):
-            raise StylesError("The selected theme changed. Reopen Theme Styles and try again.")
-        return context
+        return self.store.slot(base)
 
     def variants(self, base):
-        result = []
-        for path in (self.root(base) / "variants").glob("*/style.json"):
-            record = read_json(path)
-            if record and record.get("base") == base:
-                record["preview"] = (path.parent / "preview.jpg").as_uri()
-                result.append(record)
-        return sorted(result, key=lambda x: x["created_at"], reverse=True)
+        return self.store.variants(base)
 
     def job(self, base):
-        job = read_json(self.root(base) / "job.json", {})
-        if job.get("state") in ACTIVE_STATES:
-            alive = job.get("pid") and process_start(job["pid"]) == job.get("process_start")
-            if not alive and time.time() - job.get("started", 0) > 10:
-                job = {**job, "state": "failed", "message": "Generation was interrupted. You can generate again."}
-        job_id = job.get("id", "")
-        if isinstance(job_id, str) and re.fullmatch(r"[0-9a-f]{32}", job_id):
-            workspace = self.root(base) / "jobs" / job_id
-            logs = [workspace / name for name in ("agent.log", "image.log", "aether.log")]
-            try:
-                logs = [path for path in logs if path.is_file() and not path.is_symlink()]
-                job["log_path"] = str(max(logs, key=lambda path: path.stat().st_mtime_ns)) if logs else ""
-            except OSError:
-                job["log_path"] = ""
-        return job
+        return self.store.job(base)
+
+    def update_job(self, base, **changes):
+        return self.store.update_job(base, **changes)
+
+    def context(self):
+        return self.desktop.context()
+
+    def check_context(self, base, token=""):
+        return self.desktop.check_context(base, token)
+
+    def apply(self, base, style_id, token=""):
+        return self.desktop.apply(base, style_id, token)
+
+    def restore(self, base, token=""):
+        return self.desktop.restore(base, token)
+
+    def migrate(self):
+        return self.desktop.migrate()
+
+    def original_mode(self, base):
+        return self.desktop.original_mode(base)
+
+    def save_variant(self, job, workspace, image, rendered, mode):
+        templates = [self.desktop.omarchy / "default/themed", self.home / ".config/omarchy/themed"]
+        return self.store.save_variant(job, workspace, image, rendered, mode, templates, cancel=workspace / "cancel")
+
+    def run_process(self, argv, workspace, log_name, **kwargs):
+        return run(argv, cwd=workspace, log=workspace / log_name, cancel=workspace / "cancel", **kwargs)
 
     def status(self):
+        self.store.warnings.clear()
         context = self.context()
         missing = [name for name in ("aether", "magick", "bwrap", "omarchy") if not shutil.which(name)]
         root = self.root(context["base"])
         return {"ok": True, **context, "styles": self.variants(context["base"]),
-                "job": self.job(context["base"]), "missing": missing,
+                "job": self.job(context["base"]), "missing": missing, "warnings": list(self.store.warnings),
                 "original_preview": (root / "original/preview.jpg").as_uri() if (root / "original/preview.jpg").exists() else ""}
 
     def agent_options(self):
         context = self.context()
         catalog = self.agents.catalog()
-        saved = read_json(self.root(context["base"]) / "preferences.json", {})
+        saved = self.store.preferences(context["base"])
         return {"ok": True, "base": context["base"], "agents": catalog,
-                "selection": self.agents.selection(saved, catalog)}
+                "selection": self.agents.selection(saved, catalog), "diagnostics": self.agents.diagnostics,
+                "warnings": self.store.warnings}
 
     def configure(self, base, harness, model, thinking, token=""):
         self.check_context(base, token)
@@ -256,13 +115,13 @@ class Styles:
         root.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".original-", dir=root))
         try:
-            with lock(self.theme_lock, shared=True):
-                if self._context()["token"] != context["token"]:
+            with lock(self.desktop.theme_lock, shared=True):
+                if self.desktop._context()["token"] != context["token"]:
                     raise StylesError("The theme changed before generation started.")
                 wallpaper = Path(context["wallpaper"])
                 if not wallpaper.is_file() or wallpaper.suffix.lower() not in IMAGE_SUFFIXES:
                     raise StylesError("This theme needs a still-image wallpaper before creating styles.")
-                shutil.copytree(self.current / "theme", staging / "theme",
+                shutil.copytree(self.desktop.current / "theme", staging / "theme",
                                 ignore=shutil.ignore_patterns("backgrounds", "background", MARKER, ".git"))
                 reference = staging / ("wallpaper" + wallpaper.suffix.lower())
                 shutil.copyfile(wallpaper, reference)
@@ -283,7 +142,7 @@ class Styles:
             root = self.root(context["base"])
             variant = root / "variants" / style_id
             generated = {variant / "theme/backgrounds/style.png",
-                         self.current / "theme/backgrounds/style.png"}
+                         self.desktop.current / "theme/backgrounds/style.png"}
             if wallpaper in {path.resolve() for path in generated}:
                 record = read_json(variant / "style.json", {})
                 if record.get("reference"):
@@ -323,8 +182,10 @@ class Styles:
             raise StylesError("Install the missing tools: " + ", ".join(missing))
         root = self.root(base)
         self.check_context(base, token)
-        saved = read_json(root / "preferences.json", {})
+        saved = self.store.preferences(base)
         catalog = self.agents.catalog(harness=harness or saved.get("harness"))
+        if not catalog and self.agents.diagnostics:
+            raise StylesError(self.agents.diagnostic_message())
         selection = self.agents.selection(saved, catalog)
         if harness is not None:
             selection = {"harness": harness, "model": model or "", "thinking": thinking or ""}
@@ -353,13 +214,13 @@ class Styles:
             workspace.mkdir(parents=True, mode=0o700)
             (workspace / "agent").mkdir(mode=0o700)
             try:
-                with lock(self.theme_lock, shared=True):
-                    self.require_context(self._context(), base, context["token"])
+                with lock(self.desktop.theme_lock, shared=True):
+                    self.desktop.require_context(self.desktop._context(), base, context["token"])
                     source = self.reference_source(context, original)
                     reference = workspace / ("reference" + source.suffix.lower())
                     shutil.copyfile(source, reference)
                     # Wallpaper cycling can update the link without the theme lock.
-                    self.require_context(self._context(), base, context["token"])
+                    self.desktop.require_context(self.desktop._context(), base, context["token"])
             except Exception:
                 shutil.rmtree(workspace)
                 raise
@@ -380,46 +241,6 @@ class Styles:
                 job = self.update_job(base, expected_id=job_id, pid=process.pid,
                                       process_start=process_start(process.pid))
         return {"ok": True, "job": job}
-
-    def update_job(self, base, *, expected_id=None, **changes):
-        root = self.root(base)
-        with lock(root / "job.lock"):
-            path = root / "job.json"
-            value = read_json(path, {})
-            if expected_id is not None and value.get("id") != expected_id:
-                raise StylesError("The generation request is no longer active.")
-            if changes.get("state") == "applying" and value.get("cancel_requested"):
-                raise StylesError("Generation cancelled.")
-            value.update(changes)
-            write_json(path, value)
-            return value
-
-    def run_process(self, argv, workspace, log_name, *, timeout, stdin=None, env=None):
-        """Wait outside the shell, with cancellation and a bounded lifetime."""
-        if (workspace / "cancel").exists():
-            raise StylesError("Generation cancelled.")
-        deadline = time.monotonic() + timeout
-        # A regular file cannot block while a harness starts up without reading
-        # stdin. A pipe write here would bypass both cancellation and timeout.
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as input_file, \
-                regular_file(workspace / log_name, write=True) as output:
-            if stdin is not None:
-                input_file.write(stdin)
-                input_file.seek(0)
-            process = subprocess.Popen(argv, cwd=workspace, stdin=input_file if stdin is not None else subprocess.DEVNULL,
-                                       stdout=output, stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                                       env=env, umask=0o077)
-            try:
-                while process.poll() is None:
-                    if (workspace / "cancel").exists():
-                        raise StylesError("Generation cancelled.")
-                    if time.monotonic() > deadline:
-                        raise StylesError(f"{argv[0]} timed out. You can try again.")
-                    time.sleep(0.25)
-                if process.returncode:
-                    raise StylesError(f"{Path(argv[0]).name} failed. Details: {workspace / log_name}")
-            finally:
-                stop_process_group(process)
 
     def generate_image(self, job, workspace):
         if (workspace / "cancel").exists():
@@ -463,13 +284,14 @@ class Styles:
         selection = {key: job[key] for key in ("harness", "model", "thinking")}
         argv = self.agents.command(selection, agent, reference)
         argv, env = agent_sandbox(argv, self.home, agent,
-                                  [reference, agent / "prompt.txt", agent / "response-schema.json"], selection["harness"])
+                                  [reference, agent / "prompt.txt", agent / "response-schema.json"],
+                                  self.agents.launch_requirements(selection["harness"], argv[0]))
         try:
             self.run_process(argv, workspace, "agent.log", timeout=1200,
                              stdin=prompt if self.agents.uses_stdin(selection["harness"]) else None, env=env)
+        except (ProcessCancelled, ProcessTimedOut):
+            raise
         except StylesError as exc:
-            if (workspace / "cancel").exists() or "timed out" in str(exc):
-                raise
             raise self.image_failure(job, workspace, failed=True) from exc
         reported = self.image_failure(job, workspace, reported_only=True)
         if reported:
@@ -484,11 +306,12 @@ class Styles:
                 incoming = Path(directory) / "input"
                 copy_output(output, incoming)
                 normalized = Path(directory) / "wallpaper.png"
-                convert_image(incoming, normalized, log=workspace / "image.log")
+                convert_image(incoming, normalized, log=workspace / "image.log", cancel=workspace / "cancel")
                 normalized.replace(workspace / "wallpaper.png")
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             raise GenerationError("The agent's output was not a usable wallpaper image. " + str(exc), "invalid_image") from exc
         return workspace / "wallpaper.png"
+
 
     @staticmethod
     def image_failure(job, workspace, failed=False, reported_only=False):
@@ -515,15 +338,6 @@ class Styles:
                    if failed else f"{harness} did not save a wallpaper. Image generation may be unavailable "
                    "with this setup. Try another harness or model.")
         return GenerationError(message + f" Details: {workspace / 'agent.log'}")
-
-    def original_mode(self, base):
-        source = self.root(base) / "original/theme/colors.toml"
-        result = subprocess.run(["omarchy-theme-color", "--file", str(source), "mode"],
-                                capture_output=True, text=True, timeout=10)
-        mode = result.stdout.strip()
-        if result.returncode or mode not in {"light", "dark"}:
-            raise StylesError("Omarchy could not determine the original theme's light/dark mode.")
-        return mode
 
     def render(self, job, workspace, image):
         output = Path(tempfile.mkdtemp(prefix="rendered-", dir=workspace))
@@ -555,43 +369,6 @@ class Styles:
         finally:
             temporary.unlink(missing_ok=True)
         return output, mode
-
-    def save_variant(self, job, workspace, image, rendered, mode):
-        root = self.root(job["base"])
-        variants = root / "variants"
-        variants.mkdir(exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".saving-", dir=variants))
-        try:
-            theme = staging / "theme"
-            # Inherit assets and non-palette extras; Omarchy regenerates supported
-            # app configurations from the new palette instead of keeping old colors.
-            shutil.copytree(root / "original/theme", theme)
-            template_roots = [self.omarchy / "default/themed", self.home / ".config/omarchy/themed"]
-            for template_root in template_roots:
-                for template in template_root.glob("*.tpl"):
-                    (theme / template.name.removesuffix(".tpl")).unlink(missing_ok=True)
-            shutil.copyfile(rendered / "colors.toml", theme / "colors.toml")
-            # Markers controlling dark/light mode may come from older themes.
-            (theme / "light.mode").unlink(missing_ok=True)
-            if mode == "light":
-                (theme / "light.mode").touch()
-            backgrounds = theme / "backgrounds"
-            backgrounds.mkdir(exist_ok=True)
-            shutil.copyfile(image, backgrounds / "style.png")
-            convert_image(image, staging / "preview.jpg", thumbnail=True)
-            record = {"id": job["id"], "base": job["base"], "name": job["name"], "style": job["style"],
-                      "mode": mode, "created_at": now(), "provider": job.get("harness", "codex"),
-                      "harness": job.get("harness", "codex"), "model": job.get("model", ""),
-                      "thinking": job.get("thinking", ""), "reference": job["reference"]}
-            # Keep the source with the style so it survives cleanup of job logs.
-            shutil.copyfile(workspace / job["reference"], staging / job["reference"])
-            write_json(staging / "style.json", record)
-            write_json(theme / MARKER, {"plugin": PLUGIN_ID, "base": job["base"], "style_id": job["id"]})
-            staging.rename(variants / job["id"])
-            return record
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
 
     def worker(self, base, job_id):
         validate_id(job_id)
@@ -638,7 +415,7 @@ class Styles:
                 self.notify_failure(str(exc))
 
     def notify_failure(self, message):
-        if self.headless() or not shutil.which("notify-send"):
+        if self.desktop.headless() or not shutil.which("notify-send"):
             return
         try:
             subprocess.run(["notify-send", "--app-name", "Theme Styles", "--urgency", "critical",
@@ -646,185 +423,6 @@ class Styles:
                            capture_output=True, timeout=5)
         except (OSError, subprocess.SubprocessError):
             pass
-
-    def apply(self, base, style_id, token=""):
-        validate_id(style_id)
-        root = self.root(base)
-        with lock(root / "operation.lock"):
-            self.check_context(base, token)
-            variant = root / "variants" / style_id
-            record = read_json(variant / "style.json", {})
-            if record.get("base") != base or record.get("id") != style_id:
-                raise StylesError("This style does not belong to the current theme.")
-            wallpaper = variant / "theme/backgrounds/style.png"
-            if not wallpaper.is_file():
-                raise StylesError("This saved style's wallpaper is missing.")
-            # Only the runtime copy changes. Omarchy's next normal theme set
-            # recreates it from the original source, naturally clearing a style.
-            with lock(self.theme_lock):
-                self.require_context(self._context(), base, token)
-                next_theme = self.current / "next-theme"
-                if next_theme.exists() or next_theme.is_symlink():
-                    raise StylesError("Omarchy has an unfinished theme change. Reapply the original theme first.")
-                with tempfile.TemporaryDirectory(prefix=".theme-styles-", dir=self.current) as temporary:
-                    backup = Path(temporary)
-                    try:
-                        shutil.copytree(variant / "theme", next_theme)
-                        self.render_templates()
-                        # Keep the old runtime and selection for rollback, even
-                        # if writing the new selection fails halfway through.
-                        for name in ("theme.name", "background"):
-                            path = self.current / name
-                            if path.exists() or path.is_symlink():
-                                shutil.copy2(path, backup / name, follow_symlinks=False)
-                        (self.current / "theme").rename(backup / "theme")
-                        try:
-                            next_theme.rename(self.current / "theme")
-                            self.update_selection(base, wallpaper)
-                        except Exception:
-                            if (self.current / "theme").exists():
-                                shutil.rmtree(self.current / "theme")
-                            (backup / "theme").rename(self.current / "theme")
-                            for name in ("theme.name", "background"):
-                                if (backup / name).exists() or (backup / name).is_symlink():
-                                    os.replace(backup / name, self.current / name)
-                                else:
-                                    (self.current / name).unlink(missing_ok=True)
-                            raise
-                        self.sync_shell(wallpaper)
-                    finally:
-                        if next_theme.exists():
-                            shutil.rmtree(next_theme)
-            self.refresh_apps(base)
-        return {"ok": True, "message": f"Applied {record['name']}."}
-
-    def render_templates(self):
-        result = subprocess.run(["omarchy-theme-set-templates"], capture_output=True, text=True, timeout=60)
-        if result.returncode:
-            raise StylesError("Omarchy could not render this style: " + result.stderr.strip()[-600:])
-
-    def update_selection(self, base, wallpaper):
-        name = self.current / f".theme-name-{uuid.uuid4().hex}"
-        background = self.current / f".background-{uuid.uuid4().hex}"
-        try:
-            name.write_text(base + "\n")
-            background.symlink_to(wallpaper)
-            os.replace(name, self.current / "theme.name")
-            os.replace(background, self.current / "background")
-        finally:
-            name.unlink(missing_ok=True)
-            background.unlink(missing_ok=True)
-
-    def headless(self):
-        return os.environ.get("OMARCHY_THEME_HEADLESS") == "1" or os.environ.get("OMARCHY_THEME_OFFLINE") == "1"
-
-    def best_effort(self, argv, timeout=30):
-        # Like native theme switching, an app which isn't running must not
-        # prevent the remaining applications from receiving their colors.
-        try:
-            subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
-    def sync_shell(self, wallpaper):
-        if self.headless():
-            return
-        payloads = []
-        for filename in ("colors.toml", "shell.toml"):
-            path = self.current / "theme" / filename
-            payloads.append(base64.b64encode(path.read_bytes()).decode() if path.is_file() else "")
-        self.best_effort(["omarchy-shell", "background", "setInstant", str(wallpaper)], timeout=2)
-        self.best_effort(["omarchy-shell", "shell", "applyTheme", *payloads], timeout=2)
-
-    def refresh_apps(self, base):
-        if self.headless():
-            return
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            list(executor.map(lambda command: self.best_effort([command]),
-                              (command for command in REFRESH_COMMANDS if shutil.which(command))))
-        self.best_effort(["omarchy", "hook", "theme-set", base])
-        self.best_effort(["omarchy", "theme", "bg", "cache"])
-
-    def migrate(self):
-        """Archive only our old companion themes; retain every saved variant."""
-        harden_tree(self.data)
-        archived = []
-        for destination in self.themes.glob("*-styles-*"):
-            if destination.is_symlink() or not destination.is_dir():
-                continue
-            marker = read_json(destination / MARKER, {})
-            if marker.get("plugin") not in STYLE_OWNERS:
-                continue
-            base = validate_slug(marker.get("base", ""))
-            if destination.name != self.slot(base):
-                continue
-            root = self.root(base)
-            with lock(root / "operation.lock"), lock(self.theme_lock):
-                context = self._context()
-                archive = root / "legacy-themes" / uuid.uuid4().hex
-                archive.parent.mkdir(parents=True, exist_ok=True)
-                # The runtime is already a copy. Preserve its look while
-                # restoring the original name before retiring the old entry.
-                if context["name"] == destination.name:
-                    wallpaper = self.current / "theme/backgrounds/style.png"
-                    if not wallpaper.is_file():
-                        raise StylesError("Restore the original theme before migrating this legacy style.")
-                    self.update_selection(base, wallpaper)
-                shutil.move(str(destination), str(archive))
-                archived.append(destination.name)
-        if archived and not self.headless():
-            self.best_effort(["omarchy", "theme", "switcher", "--preload"])
-        return {"ok": True, "archived": archived}
-
-    def activate(self, slug, token=""):
-        # Hold the desktop lock from validation through mutation. The native
-        # headless setter uses a private runtime lock to avoid reacquiring ours;
-        # shell IPC and app refreshes use the real session afterwards.
-        with lock(self.theme_lock):
-            self.require_context(self._context(), slug, token)
-            if (self.current / "next-theme").exists() or (self.current / "next-theme").is_symlink():
-                raise StylesError("Omarchy has an unfinished theme change. Reapply the original theme first.")
-            with tempfile.TemporaryDirectory(prefix=".theme-styles-restore-", dir=self.current) as temporary:
-                backup = Path(temporary)
-                shutil.copytree(self.current / "theme", backup / "theme", symlinks=True)
-                for name in ("theme.name", "background"):
-                    path = self.current / name
-                    if path.exists() or path.is_symlink():
-                        shutil.copy2(path, backup / name, follow_symlinks=False)
-                runtime = backup / "runtime"
-                runtime.mkdir(mode=0o700)
-                env = {**os.environ, "HOME": str(self.home), "OMARCHY_PATH": str(self.omarchy),
-                       "OMARCHY_THEME_HEADLESS": "1", "OMARCHY_THEME_SKIP_BACKGROUND": "0",
-                       "XDG_RUNTIME_DIR": str(runtime)}
-                try:
-                    self.run_process(["omarchy", "theme", "set", slug], backup, "restore.log", timeout=90, env=env)
-                    restored = self.require_context(self._context(), slug)
-                    wallpaper = Path(restored["wallpaper"])
-                    if (restored["active"] or not wallpaper.is_file()
-                            or wallpaper.is_relative_to(self.root(slug) / "variants")):
-                        raise StylesError("The original theme has no usable wallpaper. Its saved styles have been kept.")
-                except Exception as exc:
-                    if (self.current / "theme").exists():
-                        shutil.rmtree(self.current / "theme")
-                    (backup / "theme").rename(self.current / "theme")
-                    for name in ("theme.name", "background"):
-                        if (backup / name).exists() or (backup / name).is_symlink():
-                            os.replace(backup / name, self.current / name)
-                        else:
-                            (self.current / name).unlink(missing_ok=True)
-                    detail = (backup / "restore.log").read_text(errors="replace")[-600:] if (backup / "restore.log").exists() else ""
-                    raise StylesError("Omarchy could not restore the original theme. " + (detail.strip() or str(exc))) from exc
-                finally:
-                    if (self.current / "next-theme").exists():
-                        shutil.rmtree(self.current / "next-theme")
-                self.sync_shell(wallpaper)
-        self.refresh_apps(slug)
-
-    def restore(self, base, token=""):
-        with lock(self.root(base) / "operation.lock"):
-            self.check_context(base, token)
-            self.activate(base, token)
-        return {"ok": True, "message": "Original theme restored."}
 
     def delete(self, base, style_id, token="", confirmed=False):
         if not confirmed:
@@ -837,16 +435,14 @@ class Styles:
             workspace = root / "jobs" / style_id
             if variant.is_symlink() or workspace.is_symlink():
                 raise StylesError("Refusing to delete a saved style through a symbolic link.")
-            record = read_json(variant / "style.json", {})
-            if record.get("base") != base or record.get("id") != style_id:
-                raise StylesError("This style does not belong to the current theme.")
+            record = self.store.style(base, style_id)
             job = self.job(base)
             if job.get("id") == style_id and job.get("state") in ACTIVE_STATES:
                 raise StylesError("This style is still being generated. Wait for it to finish before deleting it.")
             if context["active"] == style_id:
                 # Never leave the active background pointing at a deleted file.
                 # A failed restore retains the complete saved style for retry.
-                self.activate(base, context["token"])
+                self.desktop.activate(base, context["token"])
                 restored = self.check_context(base)
                 if restored["active"]:
                     raise StylesError("Restore the original appearance before deleting the active style.")
@@ -922,7 +518,7 @@ def main():
             result = service.cancel(args.theme)
         print(json.dumps(result, ensure_ascii=False))
     except (StylesError, OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": str(exc), "error_code": getattr(exc, "code", "operation_failed")}, ensure_ascii=False))
         sys.exit(1)
 
 

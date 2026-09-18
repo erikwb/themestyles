@@ -1,29 +1,25 @@
 """Attack the actual process/filesystem boundaries without calling an image API."""
 import os
-from pathlib import Path
 import stat
 import struct
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
 import zlib
+from pathlib import Path
+from unittest.mock import patch
 
-import test_theme_styles as fixtures
-from security import convert_image, harden_tree, regular_file, sandbox, POLICY
+import support as fixtures
+from support import StyleFixture
+
+from files import harden_tree, regular_file
+from security import POLICY, convert_image, sandbox
 from theme_styles import GenerationError
 
 
-class SecurityTests(unittest.TestCase):
-    def setUp(self):
-        self.fixture = fixtures.StylesTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
-        self.service = self.fixture.service
-        self.home = self.fixture.home
-
-    def request(self):
-        job = self.fixture.request()
+class SecurityTests(StyleFixture, unittest.TestCase):
+    def job_workspace(self):
+        job = self.request()
         return job, self.service.root("alpha") / "jobs" / job["id"]
 
     def test_log_open_rejects_symlink_hardlink_and_fifo_before_truncating(self):
@@ -45,7 +41,7 @@ class SecurityTests(unittest.TestCase):
                 log.unlink()
 
     def test_aether_ignores_preplanted_render_symlink(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         outside = self.home / "outside"
         outside.mkdir()
         (workspace / "rendered").symlink_to(outside)
@@ -56,7 +52,7 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_palette_comments_and_arbitrary_strings_do_not_reach_agent(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         palette = self.service.root("alpha") / "original/theme/colors.toml"
         palette.write_text(palette.read_text() + '\n# EVIL_COMMENT\nEVIL_KEY = "#123456"\ncolor1 = "EVIL_VALUE"\n')
         with patch.object(self.service, "run_process"), self.assertRaises(GenerationError):
@@ -66,7 +62,7 @@ class SecurityTests(unittest.TestCase):
         self.assertIn("#121822", prompt)
 
     def test_agent_output_links_and_special_files_are_rejected(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         output = workspace / "agent/wallpaper.png"
         victim = self.home / "victim.png"
         fixtures.png(victim)
@@ -86,7 +82,7 @@ class SecurityTests(unittest.TestCase):
                 output.unlink()
 
     def test_unsafe_failure_report_is_not_read(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         report = workspace / "agent/failure.json"
         os.mkfifo(report)
         self.assertIsNone(self.service.image_failure(job, workspace, reported_only=True))
@@ -97,7 +93,7 @@ class SecurityTests(unittest.TestCase):
         self.assertIsNone(self.service.image_failure(job, workspace, reported_only=True))
 
     def test_real_agent_cannot_read_home_write_backend_or_change_inputs(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         secret = self.home / ".ssh/id_ed25519"
         secret.parent.mkdir()
         secret.write_text("private")
@@ -145,7 +141,7 @@ else:
         self.assertEqual(secret.read_text(), "private")
 
     def test_private_permissions_upgrade_does_not_follow_links(self):
-        root = self.service.data
+        root = self.service.store.data
         root.chmod(0o755)
         nested = root / "old-job"
         nested.mkdir(mode=0o755)
@@ -166,7 +162,7 @@ else:
         self.assertEqual(stat.S_IMODE((nested / "new.log").stat().st_mode), 0o600)
 
     def test_detached_agent_child_cannot_survive_the_sandbox(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         attack = self.home / "fake-agent"
         attack.write_text('''#!/usr/bin/env python3
 import subprocess, sys, time
@@ -222,12 +218,12 @@ Path("failure.json").write_text('{"error_code":"unsupported"}')
             work = Path(argv[argv.index("--chdir") + 1])
             (work / "wallpaper.png").symlink_to(victim)
             return subprocess.CompletedProcess(argv, 0, "320 256", "")
-        with patch("security.subprocess.run", side_effect=malicious_decoder), self.assertRaises(OSError):
+        with patch("security.run", side_effect=malicious_decoder), self.assertRaises(OSError):
             convert_image(source, destination)
         self.assertFalse(destination.exists())
 
     def test_aether_only_returns_literal_colors_to_native_templates(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         image = workspace / "wallpaper.png"
         fixtures.png(image)
         def malicious_aether(argv, *_args, **_kwargs):
@@ -238,7 +234,7 @@ Path("failure.json").write_text('{"error_code":"unsupported"}')
         self.assertNotIn("malicious", (rendered / "colors.toml").read_text())
 
     def test_missing_sandbox_never_runs_harness(self):
-        job, workspace = self.request()
+        job, workspace = self.job_workspace()
         with patch("security.shutil.which", return_value=None), patch.object(self.service, "run_process") as run:
             with self.assertRaisesRegex(ValueError, "bubblewrap"):
                 self.service.generate_image(job, workspace)

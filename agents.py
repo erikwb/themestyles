@@ -7,35 +7,43 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import re
 import selectors
 import shutil
-import signal
 import sqlite3
 import subprocess
 import time
-import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from pathlib import Path
+
+import tomllib
+
+from errors import ProcessTimedOut
+from harnesses import HARNESS_NAMES, HARNESSES, launch_requirements
+from processes import run as run_command
+from processes import stop_process_group
 
 DEFAULT_MODEL = "@default"
-HARNESS_NAMES = {"codex": "Codex", "grok": "Grok", "claude": "Claude Code", "pi": "Pi",
-                 "opencode": "OpenCode", "muse": "Muse", "gemini": "Gemini",
-                 "copilot": "Copilot", "cursor-agent": "Cursor", "omp": "Oh My Pi",
-                 "hermes": "Hermes", "openclaw": "OpenClaw", "crush": "Crush"}
+
 
 
 class AgentError(ValueError):
     pass
 
 
+def signed_out(text):
+    return bool(re.search(r"not (?:logged in|authenticated)|sign in|log in|login required", text, re.IGNORECASE))
+
+
 def read(path, *, toml=False):
     try:
         text = Path(path).read_text()
         return tomllib.loads(text) if toml else json.loads(text)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as exc:
+        raise AgentError(f"Could not read harness settings: {path}") from exc
 
 
 def safe_binary(name):
@@ -71,7 +79,7 @@ def safe_binary(name):
 
 
 def run(binary, *args):
-    result = subprocess.run([binary, *args], capture_output=True, text=True, timeout=8)
+    result = run_command([binary, *args], timeout=8, check=False)
     return result.returncode, result.stdout + result.stderr
 
 
@@ -151,13 +159,7 @@ def copilot_metadata(binary):
                         return answers
         return answers
     finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+        stop_process_group(process)
         process.stdin.close()
         process.stdout.close()
 
@@ -167,12 +169,21 @@ class Agents:
         self.home = Path(home) if home else Path.home()
         self.config = Path(os.environ.get("XDG_CONFIG_HOME", self.home / ".config"))
         self.data = Path(os.environ.get("XDG_DATA_HOME", self.home / ".local/share"))
+        self.diagnostics = []
+
+    def paths(self, harness):
+        return HARNESSES[harness].paths(self.home, os.environ)
+
+    def launch_requirements(self, harness, binary):
+        return launch_requirements(harness, binary, self.home, safe_binary)
 
     def codex(self, binary):
         code, status = run(binary, "login", "status")
-        if code or "Logged in" not in status:
+        if signed_out(status):
             return None
-        directory = Path(os.environ.get("CODEX_HOME", self.home / ".codex"))
+        if code or "Logged in" not in status:
+            raise AgentError("Codex returned an unsuccessful or unrecognized account status.")
+        directory = self.paths("codex")[0]
         config = read(directory / "config.toml", toml=True)
         models = []
         for entry in read(directory / "models_cache.json").get("models", []):
@@ -189,10 +200,11 @@ class Agents:
     def grok(self, binary):
         # The account-specific catalog is emitted without starting a conversation.
         code, status = run(binary, "models")
-        if (code or re.search(r"not (?:logged in|authenticated)", status, re.I)
-                or not re.search(r"(?:logged in|authenticated|using.*api.key)", status, re.I)):
+        if signed_out(status):
             return None
-        directory = self.home / ".grok"
+        if code or not re.search(r"(?:logged in|authenticated|using.*api.key)", status, re.I):
+            raise AgentError("Grok returned an unsuccessful or unrecognized account status.")
+        directory = self.paths("grok")[0]
         config = read(directory / "config.toml", toml=True)
         listed = set(re.findall(r"^\s*[-*]\s+(\S+)", status, re.M))
         catalog = read(directory / "models_cache.json")
@@ -213,11 +225,14 @@ class Agents:
 
     def claude(self, binary):
         code, output = run(binary, "auth", "status")
-        if code or not json.loads(output).get("loggedIn"):
+        authenticated = json.loads(output).get("loggedIn")
+        if authenticated is False:
             return None
-        directory = Path(os.environ.get("CLAUDE_CONFIG_DIR", self.home / ".claude"))
+        if code or authenticated is not True:
+            raise AgentError("Claude Code returned an unsuccessful or unrecognized account status.")
+        directory = self.paths("claude")[0]
         settings = read(directory / "settings.json")
-        cache = read(self.home / ".claude.json")
+        cache = read(self.paths("claude")[1])
         models = []
         for entry in cache.get("additionalModelOptionsCache", []):
             if entry.get("value"):
@@ -228,7 +243,7 @@ class Agents:
         return self.entry("claude", "Claude Code", models, settings.get("model", ""), settings.get("effortLevel", ""))
 
     def pi(self, binary):
-        directory = Path(os.environ.get("PI_CODING_AGENT_DIR", self.home / ".pi/agent"))
+        directory = self.paths("pi")[0]
         auth = read(directory / "auth.json")
         stored_providers = {k for k, v in auth.items() if has_credential(v)}
         code, output = run(binary, "--offline", "--list-models")
@@ -269,7 +284,7 @@ class Agents:
         return self.entry("pi", "Pi", models, preferred, settings.get("defaultThinkingLevel", ""))
 
     def opencode(self, binary):
-        auth = read(self.data / "opencode/auth.json")
+        auth = read(self.paths("opencode")[1] / "auth.json")
         providers = {key for key, value in auth.items() if has_credential(value)}
         # `auth list` also reports provider credentials inherited from the env.
         code, summary = run(binary, "auth", "list")
@@ -288,7 +303,7 @@ class Agents:
         return self.entry("opencode", "OpenCode", models, "", "")
 
     def muse(self, binary):
-        directory = self.config / "muse"
+        directory = self.paths("muse")[0]
         auth = read(directory / "auth.json")
         if not (os.environ.get("META_API_KEY") or has_credential(auth)
                 or any(has_credential(x) for x in auth.get("providers", auth).values() if isinstance(x, dict))):
@@ -298,10 +313,10 @@ class Agents:
         return self.entry("muse", "Muse", [], selected if isinstance(selected, str) else "", "")
 
     def gemini(self, binary):
-        directory = self.home / ".gemini"
+        directory = self.paths("gemini")[0]
         settings = read(directory / "settings.json")
         oauth = read(directory / "oauth_creds.json")
-        adc = read(self.config / "gcloud/application_default_credentials.json")
+        adc = read(self.paths("gemini")[1] / "application_default_credentials.json")
         if not (has_credential(oauth) or has_credential(adc)
                 or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
             return None
@@ -310,29 +325,33 @@ class Agents:
 
     def copilot(self, binary):
         responses = copilot_metadata(binary)
-        if not responses.get(1, {}).get("isAuthenticated"):
+        authenticated = responses.get(1, {}).get("isAuthenticated")
+        if authenticated is False:
             return None
+        if authenticated is not True:
+            raise AgentError("Copilot did not return an account status.")
         models = [model(x["id"], x.get("name"), x.get("supportedReasoningEfforts", []),
                         x.get("defaultReasoningEffort", ""))
                   for x in responses.get(2, {}).get("models", []) if x.get("id")]
-        directory = Path(os.environ.get("COPILOT_HOME", self.home / ".copilot"))
+        directory = self.paths("copilot")[0]
         settings = read(directory / "settings.json") or read(directory / "config.json")
         return self.entry("copilot", "Copilot", models, settings.get("model", ""),
                           settings.get("reasoning_effort", ""))
 
     def cursor_agent(self, binary):
         code, status = run(binary, "status")
-        if (code or re.search(r"not (?:logged in|authenticated)", status, re.I)
-                or not re.search(r"logged in|authenticated", status, re.I)):
+        if signed_out(status):
             return None
-        settings = read(self.home / ".cursor/cli-config.json")
+        if code or not re.search(r"logged in|authenticated", status, re.I):
+            raise AgentError("Cursor returned an unsuccessful or unrecognized account status.")
+        settings = read(self.paths("cursor-agent")[0] / "cli-config.json")
         selected = settings.get("model", "")
         if isinstance(selected, dict):
             selected = selected.get("id", "")
         return self.entry("cursor-agent", "Cursor", [], selected, "")
 
     def omp(self, binary):
-        directory = Path(os.environ.get("PI_CODING_AGENT_DIR", self.home / ".omp/agent"))
+        directory = self.paths("omp")[0]
         providers = set()
         database = directory / "agent.db"
         if database.is_file():
@@ -358,7 +377,7 @@ class Agents:
         return self.entry("omp", "Oh My Pi", models, "", "")
 
     def hermes(self, binary):
-        directory = Path(os.environ.get("HERMES_HOME", self.home / ".hermes"))
+        directory = self.paths("hermes")[0]
         auth = read(directory / "auth.json")
         credentials = list(auth.get("providers", {}).values())
         for pool in auth.get("credential_pool", {}).values():
@@ -398,8 +417,8 @@ class Agents:
         return self.entry("openclaw", "OpenClaw", models, status.get("resolvedDefault", ""), "")
 
     def crush(self, binary):
-        settings = read(self.config / "crush/crush.json")
-        stored = read(self.data / "crush/crush.json")
+        settings = read(self.paths("crush")[0] / "crush.json")
+        stored = read(self.paths("crush")[1] / "crush.json")
         providers = settings.get("providers", {}) | stored.get("providers", {})
         active = {}
         for key, info in providers.items():
@@ -431,16 +450,23 @@ class Agents:
 
     def catalog(self, harness=None):
         def inspect(name):
-            binary = safe_binary(name)
-            if not binary:
-                return None
             try:
-                return getattr(self, name.replace("-", "_"))(binary)
-            except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
-                return None
+                binary = safe_binary(name)
+                if not binary:
+                    return None, None
+                return getattr(self, name.replace("-", "_"))(binary), None
+            except Exception as exc:
+                # Keep other accounts usable, but do not turn adapter bugs into a
+                # silent signed-out result. Exception payloads may contain credentials.
+                code = "discovery_timeout" if isinstance(exc, ProcessTimedOut) else "discovery_failed"
+                message = ("Account discovery timed out." if code == "discovery_timeout" else str(exc)
+                           if isinstance(exc, AgentError) else f"Could not read account/model information ({type(exc).__name__}).")
+                return None, {"harness": name, "label": HARNESS_NAMES[name], "code": code, "message": message}
         with ThreadPoolExecutor(max_workers=4) as pool:
             names = [harness] if harness in HARNESS_NAMES else ([] if harness else HARNESS_NAMES)
-            return [entry for entry in pool.map(inspect, names) if entry]
+            results = list(pool.map(inspect, names))
+        self.diagnostics = [diagnostic for _, diagnostic in results if diagnostic]
+        return [entry for entry, _ in results if entry]
 
     def selection(self, saved=None, catalog=None):
         entries = self.catalog() if catalog is None else catalog
@@ -455,8 +481,13 @@ class Agents:
         return {"harness": entry["value"], "model": selected["value"],
                 "thinking": effort if effort in {x["value"] for x in selected["thinking"]} else ""}
 
+    def diagnostic_message(self):
+        return " ".join(f"{item['label']}: {item['message']}" for item in self.diagnostics)
+
     def validate(self, selection):
         catalog = self.catalog(harness=selection.get("harness")) if selection else []
+        if not catalog and self.diagnostics:
+            raise AgentError(self.diagnostic_message())
         if not selection or self.selection(selection, catalog) != selection:
             raise AgentError("That harness, model, or thinking level is no longer available. Reopen the panel to refresh.")
         return selection
@@ -521,4 +552,4 @@ class Agents:
 
     @staticmethod
     def uses_stdin(harness):
-        return harness in {"codex", "claude", "pi", "omp", "opencode", "gemini", "crush"}
+        return HARNESSES[harness].stdin

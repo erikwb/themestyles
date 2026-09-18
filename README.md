@@ -53,6 +53,10 @@ Image generation depends on the harness's existing tools, extensions, permission
 and account limits. A failed attempt shows an error and preserves the current style.
 It does not switch to another harness or install a missing image tool.
 
+Account discovery errors appear in the panel separately from signed-out accounts.
+Custom provider variables explicitly referenced in harness configuration are passed
+to generation; unrelated environment variables are excluded.
+
 These integrations are experimental. Discovery has been checked on live Codex,
 Grok, Claude Code, and Pi installations. The other adapters have fixture tests
 but still need testing with signed-in installations. Stored credentials can expire,
@@ -67,6 +71,7 @@ Styles, original snapshots, prompts, and logs live in
 `$XDG_DATA_HOME/omarchy-theme-styles`, normally `~/.local/share/omarchy-theme-styles`.
 Inspect logs before sharing them: they may contain prompts and agent output.
 The store is restricted to your user. Failed jobs are retained for troubleshooting.
+Damaged saved-style records are reported individually while other styles remain usable.
 
 Agents run in a Bubblewrap sandbox with a private home, temporary configuration
 for the selected harness, and a writable output folder. Your desktop sockets,

@@ -24,6 +24,7 @@ Panel {
   property real requestStarted: 0
   property real clockNow: Date.now()
   property var agents: []
+  property var agentDiagnostics: []
   property string agentsTheme: ""
   property string harness: ""
   property string model: ""
@@ -64,6 +65,27 @@ Panel {
 
   function refreshAgents() {
     if (root.base && !agentProcess.running) agentProcess.running = true
+  }
+
+  function receiveAgents(result) {
+    if (!result.ok) {
+      root.agents = []
+      root.agentsTheme = ""
+      root.agentDiagnostics = []
+      root.harness = ""
+      root.model = ""
+      root.thinking = ""
+      root.message = result.error || "Unable to check agent accounts. Reopen the panel to retry."
+      root.messageError = true
+      return
+    }
+    if (result.base !== root.base) return
+    root.agents = result.agents || []
+    root.agentDiagnostics = result.diagnostics || []
+    root.agentsTheme = result.base
+    root.harness = (result.selection || {}).harness || ""
+    root.model = (result.selection || {}).model || ""
+    root.thinking = (result.selection || {}).thinking || ""
   }
 
   function chooseHarness(value) {
@@ -108,6 +130,7 @@ Panel {
       root.messageError = false
       viewport.contentY = 0
       root.agents = []
+      root.agentDiagnostics = []
       root.agentsTheme = ""
       root.harness = ""
       root.model = ""
@@ -220,17 +243,9 @@ Panel {
     stdout: StdioCollector {
       onStreamFinished: {
         try {
-          var result = JSON.parse(text)
-          if (result.ok && result.base === root.base) {
-            root.agents = result.agents || []
-            root.agentsTheme = result.base
-            root.harness = result.selection.harness || ""
-            root.model = result.selection.model || ""
-            root.thinking = result.selection.thinking || ""
-          }
+          root.receiveAgents(JSON.parse(text))
         } catch (error) {
-          root.message = "Unable to check agent accounts. Reopen the panel to retry."
-          root.messageError = true
+          root.receiveAgents({ok: false})
         }
       }
     }
@@ -340,6 +355,17 @@ Panel {
             wrapMode: Text.Wrap
           }
 
+          Text {
+            width: parent.width
+            visible: (root.state.warnings || []).length > 0
+            text: (root.state.warnings || []).map(item => item.message + "\n" + item.path).join("\n")
+            textFormat: Text.PlainText
+            color: Color.urgent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
+          }
+
           Column {
             width: parent.width
             spacing: Style.space(6)
@@ -409,6 +435,7 @@ Panel {
           Text {
             width: parent.width
             text: agentProcess.running ? "Checking signed-in agents…"
+              : root.agentDiagnostics.length ? root.agentDiagnostics.map(item => item.label + ": " + item.message).join("\n")
               : root.agents.length ? "Try any signed-in agent. If it cannot generate an image, you'll get an error."
               : "No signed-in agent found. Sign in to an installed harness, then reopen this panel."
             textFormat: Text.PlainText
