@@ -1,7 +1,8 @@
-"""Discover installed, authenticated harnesses; image generation is tried on use.
+"""Discover authenticated harnesses and their eligible model catalogs.
 
-No model or harness is excluded for missing image support. Never run Omarchy's
-lazy installation wrappers, and never return credentials in the public catalog.
+OpenCode requires advertised image input and output. Other harnesses can supply
+image tools independently of the model. Never run Omarchy's lazy installation
+wrappers or return credentials in the public catalog.
 """
 from __future__ import annotations
 
@@ -291,16 +292,33 @@ class Agents:
         if not providers and (code or not re.search(r"[1-9]\d* (?:credentials?|environment variables?)", summary)):
             return None
         code, output = run(binary, "models", "--verbose")
+        if code:
+            raise AgentError("Could not read OpenCode's image-generation capabilities. Reopen the panel to retry.")
         models = []
-        if not code:
-            for info in json_objects(output):
-                if not info.get("id") or not info.get("providerID"):
-                    continue
-                provider = info["providerID"]
-                if providers and provider not in providers:
-                    continue
-                models.append(model(provider + "/" + info["id"], info.get("name"), list(info.get("variants", {}))))
-        return self.entry("opencode", "OpenCode", models, "", "")
+        for info in json_objects(output):
+            if not info.get("id") or not info.get("providerID"):
+                continue
+            provider = info["providerID"]
+            if providers and provider not in providers:
+                continue
+            capabilities = info.get("capabilities")
+            if not isinstance(capabilities, dict):
+                continue
+            image_input = capabilities.get("input")
+            image_output = capabilities.get("output")
+            if not isinstance(image_input, dict) or not isinstance(image_output, dict):
+                continue
+            # A router's aggregate capabilities do not guarantee its chosen model.
+            if image_input.get("image") is not True or image_output.get("image") is not True or info["id"] == "openrouter/auto":
+                continue
+            models.append(model(provider + "/" + info["id"], info.get("name"), list(info.get("variants", {}))))
+        entry = (self.entry("opencode", "OpenCode", models, "", "") if models else
+                 {"value": "opencode", "label": "OpenCode", "models": [], "model": "", "thinking": ""})
+        entry["notice"] = (
+            "Only models advertising image input and output are shown. OpenCode still needs an image-generation tool."
+            if models else "No models with image input and output are available from your signed-in OpenCode providers."
+        )
+        return entry
 
     def muse(self, binary):
         directory = self.paths("muse")[0]
@@ -488,6 +506,8 @@ class Agents:
         catalog = self.catalog(harness=selection.get("harness")) if selection else []
         if not catalog and self.diagnostics:
             raise AgentError(self.diagnostic_message())
+        if catalog and not catalog[0]["models"]:
+            raise AgentError(catalog[0].get("notice", "No eligible models are available for this harness."))
         if not selection or self.selection(selection, catalog) != selection:
             raise AgentError("That harness, model, or thinking level is no longer available. Reopen the panel to refresh.")
         return selection

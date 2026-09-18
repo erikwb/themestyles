@@ -49,6 +49,14 @@ Models and thinking levels come from each adapter's available catalog or setting
 adapter cannot enumerate options. Selections are saved separately for each theme.
 Changing harness resets the model and thinking level; changing model resets thinking.
 
+OpenCode only lists models whose local catalog explicitly advertises both image
+input and image output. Vision-only models, models without capability metadata,
+and OpenRouter's automatic router are excluded. An empty filtered catalog disables
+generation; it never falls back to an unchecked model. OpenCode still needs a
+configured image-generation tool: its CLI does not expose native image output.
+Other harnesses keep their existing catalogs because their image tools can be
+independent of the selected model.
+
 Image generation depends on the harness's existing tools, extensions, permissions,
 and account limits. A failed attempt shows an error and preserves the current style.
 It does not switch to another harness or install a missing image tool.

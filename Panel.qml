@@ -104,7 +104,7 @@ Panel {
     root.harness = value
     root.model = selected.model || ""
     root.thinking = selected.thinking || ""
-    saveAgentChoice()
+    if (root.model) saveAgentChoice()
   }
 
   function chooseModel(value) {
@@ -447,8 +447,9 @@ Panel {
             width: parent.width
             text: agentProcess.running ? "Checking signed-in agents…"
               : root.agentDiagnostics.length ? root.agentDiagnostics.map(item => item.label + ": " + item.message).join("\n")
-              : root.agents.length ? "Try any signed-in agent. If it cannot generate an image, you'll get an error."
-              : "No signed-in agent found. Sign in to an installed harness, then reopen this panel."
+              : root.selectedHarness.notice || (root.agents.length
+                ? "Try any signed-in agent. If it cannot generate an image, you'll get an error."
+                : "No signed-in agent found. Sign in to an installed harness, then reopen this panel.")
             textFormat: Text.PlainText
             color: root.dim
             font.family: Style.font.family

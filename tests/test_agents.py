@@ -115,12 +115,55 @@ class AgentTests(unittest.TestCase):
 
     def test_opencode_reads_only_authenticated_provider_models(self):
         self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}, "other": {"type": "oauth"}})
-        catalog = '\n'.join(json.dumps({"id": "model", "providerID": p, "variants": {"high": {}}})
+        catalog = '\n'.join(json.dumps({"id": "model", "providerID": p, "variants": {"high": {}},
+                                       "capabilities": {"input": {"image": True}, "output": {"image": True}}})
                             for p in ("mine", "other"))
         with patch("agents.run", side_effect=[(0, "1 credential"), (0, catalog)]):
             result = self.agents.opencode("/opencode")
         self.assertEqual([m["value"] for m in result["models"]], ["mine/model"])
         self.assertNotIn("secret", json.dumps(result))
+
+    def test_opencode_requires_image_input_and_output_and_excludes_router(self):
+        self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}})
+        capabilities = {"input": {"image": True}, "output": {"image": True}}
+        entries = [
+            {"id": "new-image-model", "capabilities": capabilities, "variants": {"high": {}}},
+            {"id": "vision", "capabilities": {"input": {"image": True}, "output": {"image": False}}},
+            {"id": "text-to-image", "capabilities": {"input": {"image": False}, "output": {"image": True}}},
+            {"id": "unknown"},
+            {"id": "malformed", "capabilities": {"input": True, "output": "image"}},
+            {"id": "string-boolean", "capabilities": {"input": {"image": True}, "output": {"image": "true"}}},
+            {"id": "openrouter/auto", "capabilities": capabilities},
+        ]
+        output = '\n'.join(json.dumps(dict(entry, providerID="mine")) for entry in entries)
+        with patch("agents.run", side_effect=[(0, "1 credential"), (0, output)]):
+            result = self.agents.opencode("/opencode")
+        self.assertEqual([m["value"] for m in result["models"]], ["mine/new-image-model"])
+        self.assertEqual([t["value"] for t in result["models"][0]["thinking"]], ["", "high"])
+        saved = {"harness": "opencode", "model": "mine/vision", "thinking": "high"}
+        self.assertEqual(self.agents.selection(saved, [result]),
+                         {"harness": "opencode", "model": "mine/new-image-model", "thinking": ""})
+        with patch.object(self.agents, "catalog", return_value=[result]):
+            with self.assertRaises(AgentError):
+                self.agents.validate(saved)
+
+    def test_opencode_empty_image_catalog_never_uses_harness_default(self):
+        self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}})
+        with patch("agents.run", side_effect=[(0, "1 credential"), (0, '{"id":"text","providerID":"mine"}')]):
+            result = self.agents.opencode("/opencode")
+        self.assertEqual(result["models"], [])
+        self.assertEqual(result["model"], "")
+        self.assertIn("No models with image input and output", result["notice"])
+        with patch.object(self.agents, "catalog", return_value=[result]):
+            for chosen in ("", DEFAULT_MODEL, "mine/text"):
+                with self.subTest(model=chosen), self.assertRaisesRegex(AgentError, "No models with image"):
+                    self.agents.validate({"harness": "opencode", "model": chosen, "thinking": ""})
+
+    def test_opencode_catalog_failure_does_not_fall_back_to_unchecked_model(self):
+        self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}})
+        with patch("agents.run", side_effect=[(0, "1 credential"), (1, "failure")]):
+            with self.assertRaisesRegex(AgentError, "Could not read OpenCode"):
+                self.agents.opencode("/opencode")
 
     def test_file_based_adapters_require_credentials_not_just_account_metadata(self):
         cases = [("gemini", ".gemini/oauth_creds.json", {"access_token": "secret"}),

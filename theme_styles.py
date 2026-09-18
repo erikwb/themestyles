@@ -195,6 +195,9 @@ class Styles:
             raise StylesError("The saved image-generation account or model is unavailable. Choose a harness in the panel.")
         if not selection:
             raise StylesError("No signed-in agent is available. Sign in to an installed harness and reopen the panel.")
+        if not selection.get("model"):
+            entry = next(item for item in catalog if item["value"] == selection["harness"])
+            raise StylesError(entry.get("notice", "No eligible models are available for this harness."))
         with lock(root / "operation.lock", blocking=False):
             context = self.check_context(base, token)
             if self.job(base).get("state") in ACTIVE_STATES:

@@ -64,6 +64,16 @@ class StylesTests(StyleFixture, unittest.TestCase):
             with self.assertRaisesRegex(StylesError, "No signed-in"):
                 self.request()
 
+    def test_empty_filtered_catalog_cannot_start_or_create_a_job(self):
+        catalog = [{"value": "opencode", "label": "OpenCode", "models": [], "model": "", "thinking": "",
+                    "notice": "No models with image input and output are available."}]
+        with patch.object(self.service.agents, "catalog", return_value=catalog):
+            for selection in ({}, {"harness": "opencode", "model": "", "thinking": ""}):
+                with self.subTest(selection=selection), self.assertRaisesRegex(StylesError, "No models with image"):
+                    self.service.start("alpha", "winter", spawn=False, **selection)
+        self.assertFalse((self.service.root("alpha") / "job.json").exists())
+        self.assertFalse((self.service.root("alpha") / "jobs").exists())
+
     def test_signed_out_saved_harness_does_not_fall_back_to_another_account(self):
         self.service.configure("alpha", "grok", "grok-image", "low")
         with patch.object(self.service.agents, "catalog", return_value=CATALOG[:1]):
