@@ -31,6 +31,8 @@ Panel {
   property string thinking: ""
   readonly property var selectedHarness: agents.find(item => item.value === root.harness) || ({models: []})
   readonly property var models: selectedHarness.models || []
+  readonly property real modelLabelWidth: models.reduce((width, item) =>
+    Math.max(width, modelFontMetrics.advanceWidth(item.label)), 0)
   readonly property var selectedModel: models.find(item => item.value === root.model) || ({thinking: []})
   readonly property var thinkingLevels: selectedModel.thinking || []
   property var deleteTarget: null
@@ -58,6 +60,12 @@ Panel {
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
+
+  FontMetrics {
+    id: modelFontMetrics
+    font.family: Style.font.family
+    font.pixelSize: Style.font.body
+  }
 
   function refresh() {
     if (!statusProcess.running) statusProcess.running = true
@@ -307,7 +315,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: styleInput
-    contentWidth: panel.fittedContentWidth(Style.space(410))
+    // Leave room for control chrome and panel padding around the longest model name.
+    contentWidth: panel.fittedContentWidth(Math.max(Style.space(410), root.modelLabelWidth + Style.space(100)), Style.space(720))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(660))
 
     Item {
@@ -393,7 +402,7 @@ Panel {
             Dropdown {
               id: harnessPicker
               objectName: "harnessPicker"
-              Layout.preferredWidth: Style.space(105)
+              Layout.fillWidth: true
               label: "Harness"
               value: root.harness
               options: root.agents
@@ -404,23 +413,10 @@ Panel {
                 harnessPicker.value = Qt.binding(function() { return root.harness })
               }
             }
-            SearchableDropdown {
-              id: modelPicker
-              objectName: "modelPicker"
-              Layout.fillWidth: true
-              label: "Model"
-              value: root.model
-              options: root.models
-              placeholderText: "Find a model…"
-              onChanged: function(value) {
-                root.chooseModel(value)
-                modelPicker.value = Qt.binding(function() { return root.model })
-              }
-            }
             Dropdown {
               id: thinkingPicker
               objectName: "thinkingPicker"
-              Layout.preferredWidth: Style.space(112)
+              Layout.fillWidth: true
               label: "Thinking"
               value: root.thinking
               options: root.thinkingLevels
@@ -429,6 +425,21 @@ Panel {
                 root.saveAgentChoice()
                 thinkingPicker.value = Qt.binding(function() { return root.thinking })
               }
+            }
+          }
+
+          SearchableDropdown {
+            id: modelPicker
+            objectName: "modelPicker"
+            width: parent.width
+            enabled: !root.busy && !agentProcess.running && !root.generating
+            label: "Model"
+            value: root.model
+            options: root.models
+            placeholderText: "Find a model…"
+            onChanged: function(value) {
+              root.chooseModel(value)
+              modelPicker.value = Qt.binding(function() { return root.model })
             }
           }
 
