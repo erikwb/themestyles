@@ -449,7 +449,7 @@ Panel {
               : root.agentDiagnostics.length ? root.agentDiagnostics.map(item => item.label + ": " + item.message).join("\n")
               : root.selectedHarness.notice || (root.agents.length
                 ? "Try any signed-in agent. If it cannot generate an image, you'll get an error."
-                : "No signed-in agent found. Sign in to an installed harness, then reopen this panel.")
+                : "No compatible image connection found. Sign in to a supported harness or connect OpenRouter in OpenCode, then reopen this panel.")
             textFormat: Text.PlainText
             color: root.dim
             font.family: Style.font.family
