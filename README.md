@@ -156,10 +156,11 @@ commands also accept `--token` from `status` to guard against a changed selectio
 
 ## Development
 
-No build step or Python packages are required.
+Application code and runtime resources live in `src/`; `theme-styles` is the
+launcher. No build step or Python packages are required.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 omarchy plugin validate .
 ```
 

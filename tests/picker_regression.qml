@@ -1,7 +1,7 @@
 import QtQuick
 import Quickshell
 import QtTest as Tests
-import "plugin" as Plugin
+import "plugin/src" as Plugin
 
 Scope {
   Plugin.Panel { id: panel }
@@ -29,6 +29,7 @@ Scope {
     running: true
     onTriggered: {
       try {
+        check(panel.helper, Qt.resolvedUrl("plugin/theme-styles").toString().replace(/^file:\/\//, ""), "Backend launcher path")
         var harness = test.findChild(panel, "harnessPicker")
         var models = test.findChild(panel, "modelPicker")
         var thinking = test.findChild(panel, "thinkingPicker")

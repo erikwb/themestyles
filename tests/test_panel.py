@@ -18,8 +18,8 @@ class PanelTests(unittest.TestCase):
             root = Path(temporary)
             for name in ("Ui", "Commons"):
                 (root / name).symlink_to(SHELL / name, target_is_directory=True)
-            (root / "plugin").mkdir()
-            shutil.copyfile(SOURCE / "Panel.qml", root / "plugin/Panel.qml")
+            (root / "plugin/src").mkdir(parents=True)
+            shutil.copyfile(SOURCE / "src/Panel.qml", root / "plugin/src/Panel.qml")
             shutil.copyfile(SOURCE / "tests/picker_regression.qml", root / "shell.qml")
             # All panel subprocesses go to this fixture. No account discovery,
             # preferences, desktop changes, or image generation can run.

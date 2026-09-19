@@ -13,7 +13,7 @@ Panel {
   ipcTarget: moduleName
   manageIpc: false
 
-  readonly property string helper: decodeURIComponent(Qt.resolvedUrl("theme-styles").toString().replace(/^file:\/\//, ""))
+  readonly property string helper: decodeURIComponent(Qt.resolvedUrl("../theme-styles").toString().replace(/^file:\/\//, ""))
   property var state: ({})
   property var savedStyles: []
   property string stylesJson: ""

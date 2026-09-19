@@ -839,12 +839,12 @@ print("No image tool is configured")
         self.assertEqual(self.service.job("alpha")["id"], job["id"])
         self.assertEqual(self.service.job("alpha")["state"], "starting")
 
-    def test_spawned_worker_does_not_write_into_plugin_directory(self):
+    def test_relocated_launcher_and_worker_do_not_write_into_plugin_directory(self):
         plugin = self.home / "plugin"
         plugin.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ("theme_styles.py", "agents.py", "opencode_images.py", "harnesses.py", "security.py", "sandbox_io.py", "policy.xml", "files.py", "errors.py", "processes.py", "storage.py", "desktop.py", "theme-styles"):
-            shutil.copyfile(source / name, plugin / name)
+        shutil.copytree(source / "src", plugin / "src", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy2(source / "theme-styles", plugin / "theme-styles")
         binaries = self.home / "bin"
         binaries.mkdir()
         agent = binaries / "codex"
@@ -867,9 +867,13 @@ Path("failure.json").write_text('{"error_code": "unsupported"}')
                "XDG_RUNTIME_DIR": str(self.home / "run"), "OMARCHY_THEME_HEADLESS": "1",
                "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
                "PYTHONDONTWRITEBYTECODE": "", "PYTHONPYCACHEPREFIX": ""}
-        with patch.dict(os.environ, env), patch("theme_styles.__file__", str(plugin / "theme_styles.py")), \
+        with patch.dict(os.environ, env), patch("theme_styles.__file__", str(plugin / "src/theme_styles.py")), \
              patch("theme_styles.subprocess.Popen", side_effect=spawn):
             try:
+                launcher_env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+                result = subprocess.run([str(plugin / "theme-styles"), "status"], cwd=self.home,
+                                        env=launcher_env, capture_output=True, text=True, check=True)
+                self.assertEqual(json.loads(result.stdout)["base"], "alpha")
                 self.service.start("alpha", "Winter")
                 self.assertEqual(len(children), 1)
                 self.assertEqual(children[0].wait(timeout=10), 0)
