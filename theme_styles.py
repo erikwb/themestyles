@@ -294,7 +294,7 @@ class Styles:
         argv = self.agents.command(selection, agent, reference)
         requirements = self.agents.launch_requirements(selection["harness"], argv[0])
         if selection["harness"] == "opencode":
-            opencode_images.configure(requirements, agent, selection)
+            opencode_images.configure(requirements, agent, selection, home=self.home)
         argv, env = agent_sandbox(argv, self.home, agent, protected, requirements)
         try:
             self.run_process(argv, workspace, "agent.log", timeout=1200,

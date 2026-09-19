@@ -1,6 +1,6 @@
 """Discover authenticated harnesses and their eligible model catalogs.
 
-OpenCode uses the bundled OpenRouter image adapter. Other harnesses can supply
+OpenCode uses provider-specific image adapters. Other harnesses can supply
 image tools independently of the model. Never run Omarchy's lazy installation
 wrappers or return credentials in the public catalog.
 """
@@ -293,15 +293,31 @@ class Agents:
         if not status["connected"]:
             return None
         models = []
+        providers = status.get("providers", ["openrouter"])
+        labels = {"openrouter": "OpenRouter", "opencode": "Zen", "opencode-go": "Go"}
         for info in json_objects(output):
-            if (not isinstance(info, dict) or not info.get("id") or info.get("providerID") != "openrouter"
-                    or info.get("api", {}).get("npm") != opencode_images.PROVIDER.as_uri()):
+            if not isinstance(info, dict) or not isinstance(info.get("id"), str):
                 continue
-            models.append(model("openrouter/" + info["id"], info.get("name"), []))
+            provider = info.get("providerID")
+            if provider not in providers or provider not in labels:
+                continue
+            sdk = (info.get("api") or {}).get("npm")
+            if provider == "openrouter":
+                supported = sdk == opencode_images.PROVIDER.as_uri() and not status.get("errors")
+            else:
+                caps = info.get("capabilities") or {}
+                supported = (sdk in opencode_images.NATIVE_SDKS and
+                             isinstance(caps.get("input"), dict) and caps["input"].get("image") is True and
+                             isinstance(caps.get("output"), dict) and caps["output"].get("image") is True)
+            if supported:
+                label = (info.get("name") or info["id"]) + " · " + labels[provider]
+                efforts = [] if provider == "openrouter" else list(info.get("variants") or {})
+                models.append(model(provider + "/" + info["id"], label, efforts))
         entry = (self.entry("opencode", "OpenCode", models, "", "") if models else
                  {"value": "opencode", "label": "OpenCode", "models": [], "model": "", "thinking": ""})
-        entry["notice"] = ("Images use your OpenCode OpenRouter connection. Account charges apply." if models else
-                           "No compatible image models are available through OpenCode's OpenRouter connection.")
+        notice = ("Images use the selected OpenCode provider. Its account limits and charges apply." if models else
+                  "No compatible image models are available from your connected OpenCode providers.")
+        entry["notice"] = " ".join([notice, *status.get("errors", [])])
         return entry
 
     def muse(self, binary):

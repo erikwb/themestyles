@@ -150,9 +150,27 @@ class AgentTests(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "Could not load OpenCode"):
                 self.agents.opencode("/opencode")
 
-    def test_opencode_requires_a_connected_openrouter_account(self):
+    def test_opencode_requires_a_supported_connected_account(self):
         with patch("opencode_images.catalog", return_value=(0, "", {"connected": False})):
             self.assertIsNone(self.agents.opencode("/opencode"))
+
+    def test_opencode_native_models_require_image_io_supported_sdk_and_login(self):
+        image = {"input": {"image": True}, "output": {"image": True}}
+        base = {"id": "future", "capabilities": image, "api": {"npm": "@ai-sdk/google"}, "variants": {"high": {}}}
+        entries = [dict(base, providerID=provider) for provider in ("opencode", "opencode-go", "other")]
+        entries += [dict(base, id="vision", providerID="opencode", capabilities={"input": {"image": True}}),
+                    dict(base, id="unknown-sdk", providerID="opencode", api={"npm": "unknown"}),
+                    dict(base, id="malformed", providerID="opencode", capabilities={"input": True, "output": True})]
+        output = '\n'.join(json.dumps(entry) for entry in entries)
+        status = {"connected": True, "providers": ["opencode", "opencode-go"]}
+        with patch("opencode_images.catalog", return_value=(0, output, status)):
+            result = self.agents.opencode("/opencode")
+        self.assertEqual([m["value"] for m in result["models"]], ["opencode/future", "opencode-go/future"])
+        self.assertEqual([m["label"] for m in result["models"]], ["future · Zen", "future · Go"])
+        self.assertEqual([t["value"] for t in result["models"][0]["thinking"]], ["", "high"])
+        status["providers"] = ["opencode"]
+        with patch("opencode_images.catalog", return_value=(0, output, status)):
+            self.assertEqual([m["value"] for m in self.agents.opencode("/opencode")["models"]], ["opencode/future"])
 
     def test_file_based_adapters_require_credentials_not_just_account_metadata(self):
         cases = [("gemini", ".gemini/oauth_creds.json", {"access_token": "secret"}),

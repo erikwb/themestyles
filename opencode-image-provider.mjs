@@ -3,12 +3,12 @@ import { constants, openSync, closeSync, fstatSync, readFileSync, writeFileSync 
 import { basename, dirname, join } from "node:path";
 
 const API = "https://openrouter.ai/api/v1";
-const MAX_IMAGE_BYTES = 100 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 100 * 1024 * 1024;
 const RASTER_FORMATS = ["png", "jpeg", "webp"];
 const ZERO_USAGE = { inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
   outputTokens: { total: 0, text: 0, reasoning: 0 } };
 
-function apiURL(base = API, path) {
+export function apiURL(base = API, path) {
   const url = new URL(base.replace(/\/+$/, "") + path);
   if (url.username || url.password || (url.protocol !== "https:"
       && !(url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))))
@@ -16,7 +16,7 @@ function apiURL(base = API, path) {
   return url;
 }
 
-async function boundedJSON(response, limit) {
+export async function boundedBody(response, limit) {
   if (!response.ok) {
     await response.body?.cancel();
     const error = new Error(`Image service returned HTTP ${response.status}.`);
@@ -31,7 +31,11 @@ async function boundedJSON(response, limit) {
     if (length > limit) throw new Error("Image service response exceeds the size limit.");
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  return Buffer.concat(chunks);
+}
+
+async function boundedJSON(response, limit) {
+  return JSON.parse((await boundedBody(response, limit)).toString("utf8"));
 }
 
 export async function imageCatalog(base) {
@@ -65,7 +69,7 @@ export function imageModel(item, configured = {}) {
   };
 }
 
-function readPrivate(path, limit) {
+export function readPrivate(path, limit) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
@@ -74,11 +78,36 @@ function readPrivate(path, limit) {
   } finally { closeSync(fd); }
 }
 
-function rasterMime(data) {
+export function rasterMime(data) {
   if (data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "image/png";
   if (data[0] === 255 && data[1] === 216 && data[2] === 255) return "image/jpeg";
   if (data.toString("ascii", 0, 4) === "RIFF" && data.toString("ascii", 8, 12) === "WEBP") return "image/webp";
   throw new Error("Image service must return a PNG, JPEG, or WebP image.");
+}
+
+export function saveImage(directory, encoded) {
+  if (typeof encoded !== "string" || !encoded || encoded.length > Math.ceil(MAX_IMAGE_BYTES * 4 / 3)
+      || encoded.length % 4 || /[^A-Za-z0-9+/=]/.test(encoded) || !/^[^=]*={0,2}$/.test(encoded))
+    throw new Error("Image service returned invalid image data.");
+  const bytes = Buffer.from(encoded, "base64");
+  rasterMime(bytes);
+  if (bytes.length > MAX_IMAGE_BYTES) throw new Error("Image exceeds the size limit.");
+  writeFileSync(join(directory, "wallpaper.png"), bytes, { flag: "wx", mode: 0o600 });
+}
+
+export function beginAttempt(directory) {
+  const fd = openSync(join(directory, ".image-request-started"), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+  closeSync(fd);
+}
+
+export function failure(directory, error, provider) {
+  const code = ["authentication", "rate_limit", "unsupported"].includes(error.code) ? error.code : "failed";
+  // Never replace an earlier failure (including when a harness attempts a retry).
+  try {
+    writeFileSync(join(directory, "failure.json"), JSON.stringify({ error_code: code }), { flag: "wx", mode: 0o600 });
+  } catch (writeError) { if (writeError.code !== "EEXIST") throw writeError; }
+  const status = Number.isInteger(error.status) ? ` HTTP ${error.status}.` : "";
+  return new Error(`${provider} image generation failed (${code}).${status}`);
 }
 
 async function generate(modelId, options, call) {
@@ -97,8 +126,7 @@ async function generate(modelId, options, call) {
   const directory = dirname(jobPath);
   const output = join(directory, "wallpaper.png");
   // A persistent attempt marker prevents retries and duplicate generation requests.
-  const attempt = openSync(join(directory, ".image-request-started"), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-  closeSync(attempt);
+  beginAttempt(directory);
   try {
     const apiKey = options.apiKey || process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
@@ -127,21 +155,11 @@ async function generate(modelId, options, call) {
       signal: AbortSignal.any([AbortSignal.timeout(900000), ...(call.abortSignal ? [call.abortSignal] : [])]),
     });
     const result = await boundedJSON(response, Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 65536);
-    const encoded = result.data?.[0]?.b64_json;
-    if (typeof encoded !== "string" || !encoded || encoded.length > Math.ceil(MAX_IMAGE_BYTES * 4 / 3)
-        || encoded.length % 4 || /[^A-Za-z0-9+/=]/.test(encoded) || !/^[^=]*={0,2}$/.test(encoded))
-      throw new Error("Image service returned invalid image data.");
-    const bytes = Buffer.from(encoded, "base64");
-    rasterMime(bytes);
-    if (bytes.length > MAX_IMAGE_BYTES) throw new Error("Image exceeds the size limit.");
-    writeFileSync(output, bytes, { flag: "wx", mode: 0o600 });
+    saveImage(directory, result.data?.[0]?.b64_json);
     return JSON.stringify({ image_path: output, error_code: "" });
   } catch (error) {
-    const code = ["authentication", "rate_limit"].includes(error.code) ? error.code : "failed";
-    writeFileSync(join(directory, "failure.json"), JSON.stringify({ error_code: code }), { flag: "wx", mode: 0o600 });
     // Do not expose request bodies, provider responses, or credentials in logs.
-    const status = Number.isInteger(error.status) ? ` HTTP ${error.status}.` : "";
-    throw new Error(`OpenRouter image generation failed (${code}).${status}`);
+    throw failure(directory, error, "OpenRouter");
   }
 }
 

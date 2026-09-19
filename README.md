@@ -49,17 +49,26 @@ Models and thinking levels come from each adapter's available catalog or setting
 adapter cannot enumerate options. Selections are saved separately for each theme.
 Changing harness resets the model and thinking level; changing model resets thinking.
 
-OpenCode uses a bundled adapter for its OpenRouter connection. The picker reads
-OpenRouter's live image catalog and shows models accepting a reference image and
-producing PNG, JPEG, or WebP output, including image models absent from OpenCode's
-normal catalog. Thinking stays at **Default** for this image API. Other OpenCode
-providers are not supported by this adapter yet.
+OpenCode supports OpenRouter, Zen, and Go connections. OpenRouter models come
+from its live image catalog. Zen and Go models come from `opencode models
+--verbose` and must explicitly advertise both image input and image output, using
+a supported Google, OpenAI, or OpenAI-compatible SDK. Each model's label includes
+its provider. Zen/Go thinking levels follow OpenCode's catalog; OpenRouter's image
+API uses **Default**.
 
-The adapter loads only in Theme Styles' sandboxed OpenCode processes through
-`OPENCODE_CONFIG_CONTENT`. It uses the existing OpenRouter API key, sends one
-image request, and saves the result. It does not change OpenCode configuration,
-install packages, or affect normal OpenCode sessions. Failed requests are not
-retried automatically. Catalog failure disables generation until discovery succeeds.
+Zen and Go currently advertise no image-output models. If their catalogs add
+compatible ones, they will appear when the panel is reopened. Discovery reads
+OpenCode's refreshed model cache without changing it. These paths use
+OpenCode's existing SDK, credentials, endpoint and headers, and capture inline
+PNG, JPEG, or WebP results from Gemini, Chat Completions or Responses. They do not
+guess a separate image endpoint. A new protocol or URL-only image response would
+still require adapter support. An image capability flag cannot guarantee that an
+account or subscription permits generation.
+
+The adapters load only in Theme Styles' sandboxed OpenCode processes through
+`OPENCODE_CONFIG_CONTENT`. They do not change OpenCode configuration, install
+packages, or affect normal sessions. Only one generation request is allowed per
+job. A failed OpenRouter catalog fetch does not hide eligible Zen or Go models.
 Other harnesses use their existing image tools and catalogs.
 
 Image generation depends on the harness's existing tools, extensions, permissions,
@@ -72,9 +81,11 @@ to generation; unrelated environment variables are excluded.
 
 These integrations are experimental. Discovery has been checked on live Codex,
 Grok, Claude Code, Pi, and OpenCode installations. OpenCode image requests are
-tested with OpenCode 1.18.31 and a local mock service, without paid generation.
-The other adapters have fixture tests but still need testing with signed-in installations. Stored credentials can expire,
-so some login failures are only detected when generating.
+tested with OpenCode 1.18.31 and local mock services, without paid generation.
+Zen and Go have not been tested against subscribed accounts.
+The other adapters have fixture tests but still need testing with signed-in
+installations. Stored credentials can expire, so some login failures are only
+detected when generating.
 
 ## Files and privacy
 
