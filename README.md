@@ -49,13 +49,18 @@ Models and thinking levels come from each adapter's available catalog or setting
 adapter cannot enumerate options. Selections are saved separately for each theme.
 Changing harness resets the model and thinking level; changing model resets thinking.
 
-OpenCode only lists models whose local catalog explicitly advertises both image
-input and image output. Vision-only models, models without capability metadata,
-and OpenRouter's automatic router are excluded. An empty filtered catalog disables
-generation; it never falls back to an unchecked model. OpenCode still needs a
-configured image-generation tool: its CLI does not expose native image output.
-Other harnesses keep their existing catalogs because their image tools can be
-independent of the selected model.
+OpenCode uses a bundled adapter for its OpenRouter connection. The picker reads
+OpenRouter's live image catalog and shows models accepting a reference image and
+producing PNG, JPEG, or WebP output, including image models absent from OpenCode's
+normal catalog. Thinking stays at **Default** for this image API. Other OpenCode
+providers are not supported by this adapter yet.
+
+The adapter loads only in Theme Styles' sandboxed OpenCode processes through
+`OPENCODE_CONFIG_CONTENT`. It uses the existing OpenRouter API key, sends one
+image request, and saves the result. It does not change OpenCode configuration,
+install packages, or affect normal OpenCode sessions. Failed requests are not
+retried automatically. Catalog failure disables generation until discovery succeeds.
+Other harnesses use their existing image tools and catalogs.
 
 Image generation depends on the harness's existing tools, extensions, permissions,
 and account limits. A failed attempt shows an error and preserves the current style.
@@ -66,8 +71,9 @@ Custom provider variables explicitly referenced in harness configuration are pas
 to generation; unrelated environment variables are excluded.
 
 These integrations are experimental. Discovery has been checked on live Codex,
-Grok, Claude Code, and Pi installations. The other adapters have fixture tests
-but still need testing with signed-in installations. Stored credentials can expire,
+Grok, Claude Code, Pi, and OpenCode installations. OpenCode image requests are
+tested with OpenCode 1.18.31 and a local mock service, without paid generation.
+The other adapters have fixture tests but still need testing with signed-in installations. Stored credentials can expire,
 so some login failures are only detected when generating.
 
 ## Files and privacy

@@ -1,6 +1,6 @@
 """Discover authenticated harnesses and their eligible model catalogs.
 
-OpenCode requires advertised image input and output. Other harnesses can supply
+OpenCode uses the bundled OpenRouter image adapter. Other harnesses can supply
 image tools independently of the model. Never run Omarchy's lazy installation
 wrappers or return credentials in the public catalog.
 """
@@ -20,6 +20,7 @@ from pathlib import Path
 
 import tomllib
 
+import opencode_images
 from errors import ProcessTimedOut
 from harnesses import HARNESS_NAMES, HARNESSES, launch_requirements
 from processes import run as run_command
@@ -285,39 +286,22 @@ class Agents:
         return self.entry("pi", "Pi", models, preferred, settings.get("defaultThinkingLevel", ""))
 
     def opencode(self, binary):
-        auth = read(self.paths("opencode")[1] / "auth.json")
-        providers = {key for key, value in auth.items() if has_credential(value)}
-        # `auth list` also reports provider credentials inherited from the env.
-        code, summary = run(binary, "auth", "list")
-        if not providers and (code or not re.search(r"[1-9]\d* (?:credentials?|environment variables?)", summary)):
+        code, output, status = opencode_images.catalog(
+            binary, self.home, self.launch_requirements("opencode", binary))
+        if code or not isinstance(status, dict) or "connected" not in status:
+            raise AgentError("Could not load OpenCode's image catalog. Reopen the panel to retry.")
+        if not status["connected"]:
             return None
-        code, output = run(binary, "models", "--verbose")
-        if code:
-            raise AgentError("Could not read OpenCode's image-generation capabilities. Reopen the panel to retry.")
         models = []
         for info in json_objects(output):
-            if not info.get("id") or not info.get("providerID"):
+            if (not isinstance(info, dict) or not info.get("id") or info.get("providerID") != "openrouter"
+                    or info.get("api", {}).get("npm") != opencode_images.PROVIDER.as_uri()):
                 continue
-            provider = info["providerID"]
-            if providers and provider not in providers:
-                continue
-            capabilities = info.get("capabilities")
-            if not isinstance(capabilities, dict):
-                continue
-            image_input = capabilities.get("input")
-            image_output = capabilities.get("output")
-            if not isinstance(image_input, dict) or not isinstance(image_output, dict):
-                continue
-            # A router's aggregate capabilities do not guarantee its chosen model.
-            if image_input.get("image") is not True or image_output.get("image") is not True or info["id"] == "openrouter/auto":
-                continue
-            models.append(model(provider + "/" + info["id"], info.get("name"), list(info.get("variants", {}))))
+            models.append(model("openrouter/" + info["id"], info.get("name"), []))
         entry = (self.entry("opencode", "OpenCode", models, "", "") if models else
                  {"value": "opencode", "label": "OpenCode", "models": [], "model": "", "thinking": ""})
-        entry["notice"] = (
-            "Only models advertising image input and output are shown. OpenCode still needs an image-generation tool."
-            if models else "No models with image input and output are available from your signed-in OpenCode providers."
-        )
+        entry["notice"] = ("Images use your OpenCode OpenRouter connection. Account charges apply." if models else
+                           "No compatible image models are available through OpenCode's OpenRouter connection.")
         return entry
 
     def muse(self, binary):
@@ -544,7 +528,7 @@ class Agents:
                 argv += ["--thinking", effort]
             return argv + ["@" + str(reference)]
         if name == "opencode":
-            argv = [binary, "run", "--format", "json", "--dir", str(workspace), *choice]
+            argv = [binary, "run", "--format", "json", "--dir", str(workspace), "--agent", "theme-styles", *choice]
             if effort:
                 argv += ["--variant", effort]
             return argv

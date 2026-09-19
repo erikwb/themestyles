@@ -10,7 +10,7 @@ import tomllib
 
 PROVIDER_KEYS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY",
                  "META_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "NOUS_API_KEY")
-CONFIG_FILES = ("config.toml", "config.json", "settings.json", "models.json", "opencode.json", "crush.json", "mcp.json")
+CONFIG_FILES = ("config.toml", "config.json", "settings.json", "models.json", "opencode.json", "opencode.jsonc", "crush.json", "mcp.json")
 # Config-declared API/MCP variables are permitted; process and desktop overrides are not.
 BLOCKED_ENV = {"HOME", "PATH", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "TMPDIR", "BASH_ENV", "ENV",
                "SSH_AUTH_SOCK", "SSH_AGENT_PID", "DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
@@ -75,7 +75,8 @@ def configured_environment(paths):
                 continue
             try:
                 content = path.read_text()
-                value = tomllib.loads(content) if path.suffix == ".toml" else json.loads(content)
+                value = (content if path.suffix == ".jsonc" else
+                         tomllib.loads(content) if path.suffix == ".toml" else json.loads(content))
                 names.update(environment_references(value))
             except (OSError, ValueError):
                 continue  # Discovery reports malformed harness configuration separately.

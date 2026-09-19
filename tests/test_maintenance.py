@@ -106,6 +106,18 @@ class LaunchTests(unittest.TestCase):
         self.assertNotIn("LD_PRELOAD", requirements.environment)
         self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", requirements.environment)
 
+    def test_opencode_jsonc_can_reference_a_custom_key(self):
+        config = self.home / ".config/opencode"
+        config.mkdir(parents=True)
+        (config / "opencode.jsonc").write_text('''{
+            // Credentials remain in the environment.
+            "provider": {"openrouter": {"options": {"apiKey": "{env:CUSTOM_IMAGE_KEY}"}}},
+        }''')
+        with patch.dict(os.environ, {"CUSTOM_IMAGE_KEY": "fixture", "UNRELATED_SECRET": "private"}):
+            requirements = self.agents.launch_requirements("opencode", sys.executable)
+        self.assertEqual(requirements.environment["CUSTOM_IMAGE_KEY"], "fixture")
+        self.assertNotIn("UNRELATED_SECRET", requirements.environment)
+
     def test_custom_install_can_import_its_package_siblings(self):
         package = self.home / "custom-install"
         package.mkdir()

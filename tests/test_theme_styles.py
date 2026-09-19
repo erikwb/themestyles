@@ -1,5 +1,6 @@
 """Behavior tests use an isolated home; no desktop or paid generation is touched."""
 import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -447,7 +448,11 @@ print("No image tool is configured")
                 with self.assertRaises(GenerationError):
                     self.service.generate_image(attempt, workspace)
                 args, kwargs = process.call_args
-                if self.service.agents.uses_stdin(harness):
+                if harness == "opencode":
+                    image_job = json.loads((workspace / "agent/image-job.json").read_text())
+                    self.assertEqual(kwargs["stdin"], image_job["marker"])
+                    self.assertIn(job["style"], image_job["prompt"])
+                elif self.service.agents.uses_stdin(harness):
                     self.assertIn("Create exactly one wallpaper", kwargs["stdin"])
                 else:
                     self.assertTrue(any("prompt.txt" in a or "Create exactly one wallpaper" in a for a in args[0]))
@@ -838,7 +843,7 @@ print("No image tool is configured")
         plugin = self.home / "plugin"
         plugin.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ("theme_styles.py", "agents.py", "harnesses.py", "security.py", "policy.xml", "files.py", "errors.py", "processes.py", "storage.py", "desktop.py", "theme-styles"):
+        for name in ("theme_styles.py", "agents.py", "opencode_images.py", "harnesses.py", "security.py", "policy.xml", "files.py", "errors.py", "processes.py", "storage.py", "desktop.py", "theme-styles"):
             shutil.copyfile(source / name, plugin / name)
         binaries = self.home / "bin"
         binaries.mkdir()

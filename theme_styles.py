@@ -16,6 +16,7 @@ from pathlib import Path
 
 import tomllib
 
+import opencode_images
 from agents import HARNESS_NAMES, Agents
 from desktop import OmarchyDesktop
 from errors import GenerationError, ProcessCancelled, ProcessTimedOut, StylesError
@@ -282,13 +283,19 @@ class Styles:
             "Return its absolute path in image_path and an empty error_code on success. "
             "On failure return an empty image_path and the error_code."
         )
+        protected = [reference, agent / "prompt.txt", agent / "response-schema.json"]
+        if job["harness"] == "opencode":
+            reference, prompt = opencode_images.prepare(job, agent, reference, palette,
+                                                       cancel=workspace / "cancel")
+            protected = [reference, agent / "prompt.txt", agent / "response-schema.json", agent / "image-job.json"]
         with regular_file(agent / "prompt.txt", write=True) as handle:
             handle.write(prompt.encode())
         selection = {key: job[key] for key in ("harness", "model", "thinking")}
         argv = self.agents.command(selection, agent, reference)
-        argv, env = agent_sandbox(argv, self.home, agent,
-                                  [reference, agent / "prompt.txt", agent / "response-schema.json"],
-                                  self.agents.launch_requirements(selection["harness"], argv[0]))
+        requirements = self.agents.launch_requirements(selection["harness"], argv[0])
+        if selection["harness"] == "opencode":
+            opencode_images.configure(requirements, agent, selection)
+        argv, env = agent_sandbox(argv, self.home, agent, protected, requirements)
         try:
             self.run_process(argv, workspace, "agent.log", timeout=1200,
                              stdin=prompt if self.agents.uses_stdin(selection["harness"]) else None, env=env)

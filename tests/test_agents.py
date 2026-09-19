@@ -8,6 +8,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
+import opencode_images
 from agents import (
     DEFAULT_MODEL,
     HARNESS_NAMES,
@@ -113,57 +114,45 @@ class AgentTests(unittest.TestCase):
         with patch("agents.run", return_value=(1, "unknown option")):
             self.assertEqual(self.agents.pi("/pi")["model"], DEFAULT_MODEL)
 
-    def test_opencode_reads_only_authenticated_provider_models(self):
-        self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}, "other": {"type": "oauth"}})
-        catalog = '\n'.join(json.dumps({"id": "model", "providerID": p, "variants": {"high": {}},
-                                       "capabilities": {"input": {"image": True}, "output": {"image": True}}})
-                            for p in ("mine", "other"))
-        with patch("agents.run", side_effect=[(0, "1 credential"), (0, catalog)]):
-            result = self.agents.opencode("/opencode")
-        self.assertEqual([m["value"] for m in result["models"]], ["mine/model"])
-        self.assertNotIn("secret", json.dumps(result))
-
-    def test_opencode_requires_image_input_and_output_and_excludes_router(self):
-        self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}})
-        capabilities = {"input": {"image": True}, "output": {"image": True}}
+    def test_opencode_only_lists_models_using_its_image_adapter(self):
         entries = [
-            {"id": "new-image-model", "capabilities": capabilities, "variants": {"high": {}}},
-            {"id": "vision", "capabilities": {"input": {"image": True}, "output": {"image": False}}},
-            {"id": "text-to-image", "capabilities": {"input": {"image": False}, "output": {"image": True}}},
-            {"id": "unknown"},
-            {"id": "malformed", "capabilities": {"input": True, "output": "image"}},
-            {"id": "string-boolean", "capabilities": {"input": {"image": True}, "output": {"image": "true"}}},
-            {"id": "openrouter/auto", "capabilities": capabilities},
+            {"id": "test/image", "providerID": "openrouter", "variants": {"high": {}},
+             "api": {"npm": opencode_images.PROVIDER.as_uri()}},
+            {"id": "vision", "providerID": "openrouter", "api": {"npm": "@openrouter/ai-sdk-provider"}},
+            {"id": "unknown", "providerID": "openrouter"},
+            {"id": "image", "providerID": "other", "api": {"npm": opencode_images.PROVIDER.as_uri()}},
         ]
-        output = '\n'.join(json.dumps(dict(entry, providerID="mine")) for entry in entries)
-        with patch("agents.run", side_effect=[(0, "1 credential"), (0, output)]):
+        output = '\n'.join(json.dumps(entry) for entry in entries)
+        with patch("opencode_images.catalog", return_value=(0, output, {"connected": True})):
             result = self.agents.opencode("/opencode")
-        self.assertEqual([m["value"] for m in result["models"]], ["mine/new-image-model"])
-        self.assertEqual([t["value"] for t in result["models"][0]["thinking"]], ["", "high"])
-        saved = {"harness": "opencode", "model": "mine/vision", "thinking": "high"}
+        self.assertEqual([m["value"] for m in result["models"]], ["openrouter/test/image"])
+        self.assertEqual([t["value"] for t in result["models"][0]["thinking"]], [""])
+        saved = {"harness": "opencode", "model": "openrouter/vision", "thinking": "high"}
         self.assertEqual(self.agents.selection(saved, [result]),
-                         {"harness": "opencode", "model": "mine/new-image-model", "thinking": ""})
+                         {"harness": "opencode", "model": "openrouter/test/image", "thinking": ""})
         with patch.object(self.agents, "catalog", return_value=[result]):
             with self.assertRaises(AgentError):
                 self.agents.validate(saved)
 
     def test_opencode_empty_image_catalog_never_uses_harness_default(self):
-        self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}})
-        with patch("agents.run", side_effect=[(0, "1 credential"), (0, '{"id":"text","providerID":"mine"}')]):
+        with patch("opencode_images.catalog", return_value=(0, "", {"connected": True})):
             result = self.agents.opencode("/opencode")
         self.assertEqual(result["models"], [])
         self.assertEqual(result["model"], "")
-        self.assertIn("No models with image input and output", result["notice"])
+        self.assertIn("No compatible image models", result["notice"])
         with patch.object(self.agents, "catalog", return_value=[result]):
             for chosen in ("", DEFAULT_MODEL, "mine/text"):
-                with self.subTest(model=chosen), self.assertRaisesRegex(AgentError, "No models with image"):
+                with self.subTest(model=chosen), self.assertRaisesRegex(AgentError, "No compatible image"):
                     self.agents.validate({"harness": "opencode", "model": chosen, "thinking": ""})
 
     def test_opencode_catalog_failure_does_not_fall_back_to_unchecked_model(self):
-        self.write(".local/share/opencode/auth.json", {"mine": {"key": "secret"}})
-        with patch("agents.run", side_effect=[(0, "1 credential"), (1, "failure")]):
-            with self.assertRaisesRegex(AgentError, "Could not read OpenCode"):
+        with patch("opencode_images.catalog", return_value=(1, "failure", {})):
+            with self.assertRaisesRegex(AgentError, "Could not load OpenCode"):
                 self.agents.opencode("/opencode")
+
+    def test_opencode_requires_a_connected_openrouter_account(self):
+        with patch("opencode_images.catalog", return_value=(0, "", {"connected": False})):
+            self.assertIsNone(self.agents.opencode("/opencode"))
 
     def test_file_based_adapters_require_credentials_not_just_account_metadata(self):
         cases = [("gemini", ".gemini/oauth_creds.json", {"access_token": "secret"}),
