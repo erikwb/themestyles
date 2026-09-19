@@ -7,7 +7,10 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from errors import ProcessOutputLimit
+from processes import run
 from theme_styles import Styles, StylesError
 
 
@@ -24,6 +27,29 @@ class ProcessTests(unittest.TestCase):
             [sys.executable, "-c", "import sys; print(len(sys.stdin.read()))"],
             self.workspace, "agent.log", timeout=5, stdin=text)
         self.assertEqual((self.workspace / "agent.log").read_text().strip(), str(len(text)))
+
+    def test_stdout_and_stderr_logs_stop_at_the_byte_limit(self):
+        for stream in ("stdout", "stderr"):
+            for separate in (False, True):
+                with self.subTest(stream=stream, separate=separate), patch("processes.MAX_LOG_BYTES", 65536):
+                    log = self.workspace / "agent.log"
+                    code = f"import sys; sys.{stream}.write('x' * 1000000); sys.{stream}.flush()"
+                    with self.assertRaises(ProcessOutputLimit):
+                        run([sys.executable, "-c", code], timeout=5, log=log, merge_stderr=not separate)
+                    self.assertLessEqual(log.stat().st_size, 65536)
+                    if not separate or stream == "stderr":
+                        self.assertEqual(log.stat().st_size, 65536)
+
+    def test_continuous_output_cannot_bypass_cancellation(self):
+        marker = self.workspace / "cancel"
+        timer = threading.Timer(0.1, marker.touch)
+        timer.start()
+        try:
+            with self.assertRaisesRegex(StylesError, "cancelled"):
+                run([sys.executable, "-c", "import os,time\nwhile True: os.write(1,b'x'*1024); time.sleep(0.001)"],
+                    timeout=5, cancel=marker, log=self.workspace / "agent.log")
+        finally:
+            timer.join()
 
     def test_timeout_and_cancel_work_when_harness_does_not_read_stdin(self):
         for cancel in (False, True):

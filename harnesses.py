@@ -68,6 +68,16 @@ def environment_references(value):
     return set().union(*(environment_references(item) for item in values)) if values else set()
 
 
+def parse_jsonc(content):
+    """Remove comments and trailing commas without changing quoted strings."""
+    string = r'"(?:[^"\\]|\\.)*"'
+    content = re.sub(string + r'|//[^\r\n]*|/\*[\s\S]*?\*/',
+                     lambda match: match[0] if match[0].startswith('"') else " ", content)
+    content = re.sub(string + r'|,\s*(?=[}\]])',
+                     lambda match: match[0] if match[0].startswith('"') else "", content)
+    return json.loads(content)
+
+
 def configured_environment(paths):
     names = set()
     for root in paths:
@@ -76,7 +86,7 @@ def configured_environment(paths):
                 continue
             try:
                 content = path.read_text()
-                value = (content if path.suffix == ".jsonc" else
+                value = (parse_jsonc(content) if path.suffix == ".jsonc" else
                          tomllib.loads(content) if path.suffix == ".toml" else json.loads(content))
                 names.update(environment_references(value))
             except (OSError, ValueError):

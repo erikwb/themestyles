@@ -95,11 +95,14 @@ Generation may use paid account credits.
 Styles, original snapshots, prompts, and logs live in
 `$XDG_DATA_HOME/omarchy-theme-styles`, normally `~/.local/share/omarchy-theme-styles`.
 Inspect logs before sharing them: they may contain prompts and agent output.
-The store is restricted to your user. Failed jobs are retained for troubleshooting.
+The store is restricted to your user. Failed jobs retain their prompts and logs
+for troubleshooting. Each process's combined stdout/stderr is capped at 16 MiB;
+exceeding this stops the process with an error.
 Damaged saved-style records are reported individually while other styles remain usable.
 
 Agents run in a Bubblewrap sandbox with a private home, temporary configuration
-for the selected harness, and a writable output folder. Your desktop sockets,
+for the selected harness, and a 512 MiB temporary output filesystem. Only named,
+validated results are copied back; scratch files are discarded. Your desktop sockets,
 unrelated home files, and saved themes are unavailable. The reference wallpaper
 and generation instructions are read-only. If the sandbox cannot start, generation
 fails; there is no unrestricted fallback.
@@ -154,13 +157,13 @@ No build step or Python packages are required.
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 omarchy plugin validate .
-./install.sh
 ```
 
 Tests use temporary data and do not run paid generation. The native UI test
 requires Omarchy on Wayland and QtTest; it is skipped without that desktop environment.
-The installer copies runtime files to `~/.config/omarchy/plugins/io.weirdware.themestyles`
-and enables the widget. Run it after edits. If old QML persists, run `omarchy restart shell`.
+For live UI development, edit the installed checkout at
+`~/.config/omarchy/plugins/io.weirdware.themestyles`. Omarchy reloads plugin files
+when they change.
 
 ## Uninstall
 

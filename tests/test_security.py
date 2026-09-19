@@ -12,8 +12,11 @@ from unittest.mock import patch
 import support as fixtures
 from support import StyleFixture
 
+from errors import ProcessOutputLimit
 from files import harden_tree, regular_file
-from security import POLICY, convert_image, sandbox
+from harnesses import LaunchRequirements
+from processes import run
+from security import POLICY, agent_sandbox, convert_image, sandbox
 from theme_styles import GenerationError
 
 
@@ -21,6 +24,60 @@ class SecurityTests(StyleFixture, unittest.TestCase):
     def job_workspace(self):
         job = self.request()
         return job, self.service.root("alpha") / "jobs" / job["id"]
+
+    def test_workspace_quota_counts_multiple_and_unlinked_files(self):
+        workspace = self.home / "quota"
+        workspace.mkdir()
+        for unlink in (False, True):
+            with self.subTest(unlink=unlink), patch("security.MAX_WORKSPACE_BYTES", 2 * 1024 * 1024):
+                code = (
+                    "import errno,os\n"
+                    "handles=[]\n"
+                    "try:\n"
+                    " for i in range(8):\n"
+                    "  fd=os.open(str(i),os.O_CREAT|os.O_RDWR,0o600); handles.append(fd)\n"
+                    + ("  os.unlink(str(i))\n" if unlink else "")
+                    + "  os.write(fd,b'x'*(512*1024))\n"
+                    "except OSError as e:\n"
+                    " assert e.errno==errno.ENOSPC\n"
+                    "else: raise AssertionError('Workspace quota was bypassed')\n")
+                argv, env = sandbox([sys.executable, "-c", code], Path("/quota-home"), workspace,
+                                    writable=[workspace], outputs={})
+                run(argv, env=env, timeout=5)
+                self.assertEqual(list(workspace.iterdir()), [])
+
+    def test_only_named_outputs_are_imported_and_images_can_exceed_four_mib(self):
+        workspace = self.home / "quota"
+        workspace.mkdir()
+        code = "from pathlib import Path; Path('image').write_bytes(b'x'*(8*1024*1024)); Path('scratch').write_text('discard')"
+        argv, env = sandbox([sys.executable, "-c", code], Path("/quota-home"), workspace,
+                            writable=[workspace], outputs={"image": 10 * 1024 * 1024})
+        run(argv, env=env, timeout=5)
+        self.assertEqual((workspace / "image").stat().st_size, 8 * 1024 * 1024)
+        self.assertEqual([p.name for p in workspace.iterdir()], ["image"])
+
+    def test_attempt_marker_survives_termination_for_excessive_output(self):
+        workspace = self.home / "quota"
+        workspace.mkdir()
+        requirements = LaunchRequirements([], [], {"THEME_STYLES_IMAGE_JOB": str(workspace / "image-job.json")})
+        argv, env = agent_sandbox([sys.executable, "-c", "print('x'*1000000)"],
+                                  self.home, workspace, [], requirements)
+        with patch("processes.MAX_LOG_BYTES", 4096), self.assertRaises(ProcessOutputLimit):
+            run(argv, env=env, timeout=5)
+        self.assertEqual((workspace / ".image-request-started").stat().st_size, 0)
+
+    def test_output_import_rejects_oversized_files_links_and_fifos(self):
+        workspace = self.home / "quota"
+        workspace.mkdir()
+        for attack in ("Path('result').write_bytes(b'x'*4097)",
+                       "Path('result').symlink_to('/etc/passwd')", "os.mkfifo('result')",
+                       "Path('source').touch(); os.link('source','result')"):
+            with self.subTest(attack=attack):
+                argv, env = sandbox([sys.executable, "-c", "import os; from pathlib import Path; " + attack],
+                                    Path("/quota-home"), workspace, writable=[workspace], outputs={"result": 4096})
+                with self.assertRaises((ValueError, OSError)):
+                    run(argv, env=env, timeout=5)
+                self.assertFalse((workspace / "result").exists())
 
     def test_log_open_rejects_symlink_hardlink_and_fifo_before_truncating(self):
         victim = self.home / "victim"

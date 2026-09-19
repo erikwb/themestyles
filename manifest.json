@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.weirdware.themestyles",
   "name": "Theme Styles",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "author": "Erik Bourget",
   "license": "MIT",
   "description": "Generate and keep wallpaper styles for the current Omarchy theme.",

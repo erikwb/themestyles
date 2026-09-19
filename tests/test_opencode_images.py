@@ -169,6 +169,14 @@ class OpenCodeImageTests(unittest.TestCase):
         self.assertFalse((self.work / "wallpaper.png").exists())
         self.assertEqual(len([r for r in self.requests if r[0] == "POST"]), 0)
 
+    def test_attempt_marker_survives_the_temporary_generation_filesystem(self):
+        self.generate()
+        self.assertTrue((self.work / ".image-request-started").is_file())
+        (self.work / "wallpaper.png").unlink()
+        self.generate()
+        self.assertFalse((self.work / "wallpaper.png").exists())
+        self.assertEqual(len([r for r in self.requests if r[0] == "POST"]), 1)
+
     def test_signed_out_does_not_offer_image_models(self):
         self.auth.unlink()
         self.assertIsNone(self.agents.opencode(OPENCODE))

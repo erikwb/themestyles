@@ -22,5 +22,9 @@ class ProcessFailed(StylesError):
     code = "process_failed"
 
 
+class ProcessOutputLimit(StylesError):
+    code = "output_limit"
+
+
 class RecordError(StylesError):
     code = "invalid_record"

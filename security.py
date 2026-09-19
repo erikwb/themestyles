@@ -6,8 +6,10 @@ from pathlib import Path
 
 from files import regular_file
 from processes import run
+from sandbox_io import SandboxCommand
 
 MAX_IMAGE_BYTES = 100 * 1024 * 1024
+MAX_WORKSPACE_BYTES = 512 * 1024 * 1024
 POLICY = Path(__file__).resolve().with_name("policy.xml")
 
 
@@ -21,7 +23,7 @@ def copy_output(source, destination):
             outgoing.write(chunk)
 
 
-def sandbox(argv, home, workspace, *, network=False, readonly=(), overlays=(), writable=(), env=None):
+def sandbox(argv, home, workspace, *, network=False, readonly=(), overlays=(), writable=(), env=None, outputs=None):
     """Build a private root, PID namespace, home, /tmp and /run; fail closed."""
     binary = shutil.which("bwrap")
     if not binary:
@@ -50,20 +52,43 @@ def sandbox(argv, home, workspace, *, network=False, readonly=(), overlays=(), w
         elif path.is_file():
             command += ["--ro-bind", str(path.resolve()), str(path)]
     for path in writable:
-        command += ["--bind", str(path), str(path)]
+        if outputs is not None:
+            if Path(path) != Path(workspace):
+                raise ValueError("Bounded sandboxes can only write their output workspace.")
+            command += ["--size", str(MAX_WORKSPACE_BYTES), "--tmpfs", str(path)]
+        else:
+            command += ["--bind", str(path), str(path)]
     environment = {"HOME": str(home), "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
                    "XDG_CONFIG_HOME": str(home / ".config"), "XDG_DATA_HOME": str(home / ".local/share"),
                    "XDG_CACHE_HOME": str(home / ".cache"), "XDG_STATE_HOME": str(home / ".local/state"),
                    "XDG_RUNTIME_DIR": "/run/user/" + str(os.getuid()), "TMPDIR": "/tmp"}
     environment.update(env or {})
     # Environment travels via execve, not bwrap's argv (which is visible in ps).
-    return command + ["--chdir", str(workspace), "--", *map(str, argv)], environment
+    command += ["--chdir", str(workspace), "--", *map(str, argv)]
+    if outputs is not None:
+        command = SandboxCommand(command, workspace, outputs)
+    return command, environment
 
 
 def agent_sandbox(argv, home, workspace, protected, requirements):
     wrapped, environment = sandbox(argv, home, workspace, network=True, readonly=requirements.tool_roots,
                                    overlays=requirements.config_roots, writable=[workspace],
-                                   env=requirements.environment)
+                                   env=requirements.environment,
+                                   outputs={"wallpaper.png": MAX_IMAGE_BYTES, "failure.json": 65536,
+                                            "response.json": 65536, "opencode-status.json": 65536})
+    if requirements.environment.get("THEME_STYLES_IMAGE_JOB"):
+        # Reserve the one permitted OpenCode attempt in backend-owned storage.
+        # The first sandbox has its own empty filesystem; later launches see the
+        # marker read-only, so SDK retries fail before making a paid request.
+        attempt = workspace / ".image-request-started"
+        try:
+            fd = os.open(attempt, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            with regular_file(attempt, limit=0):
+                pass
+            protected = [*protected, attempt]
+        else:
+            os.close(fd)
     # Input mounts must follow the writable workspace mount.
     index = wrapped.index("--chdir")
     for path in protected:
@@ -97,7 +122,8 @@ def convert_image(source, destination, *, thumbnail=False, log=None, cancel=None
             args += ["-thumbnail", "640x360>"]
         args += ["-format", "%w %h", "-write", str(output), "info:"]
         argv, env = sandbox(args, Path("/image-home"), work, readonly=[source, POLICY], writable=[work],
-                            env={"MAGICK_CONFIGURE_PATH": str(POLICY.parent), "MAGICK_TEMPORARY_PATH": str(work)})
+                            env={"MAGICK_CONFIGURE_PATH": str(POLICY.parent), "MAGICK_TEMPORARY_PATH": str(work)},
+                            outputs={output.name: MAX_IMAGE_BYTES})
         result = run(argv, env=env, timeout=35, cancel=cancel, log=log, check=False, merge_stderr=False)
         parts = result.stdout.split()
         if result.returncode or len(parts) != 2 or not all(x.isdigit() for x in parts):

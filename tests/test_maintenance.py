@@ -13,7 +13,7 @@ from unittest.mock import patch
 from support import StyleFixture, png
 
 from agents import Agents
-from errors import ProcessCancelled, ProcessTimedOut
+from errors import ProcessCancelled, ProcessOutputLimit, ProcessTimedOut
 from security import agent_sandbox, convert_image
 
 
@@ -54,6 +54,13 @@ class StoreRecoveryTests(StyleFixture, unittest.TestCase):
             self.service.worker("alpha", job["id"])
         self.assertEqual(self.service.job("alpha")["error_code"], "timeout")
         self.assertEqual(self.service.job("alpha")["message"], "Deadline expired")
+
+    def test_log_limit_reaches_the_ui_without_becoming_an_image_support_error(self):
+        job = self.request()
+        with patch.object(self.service, "run_process", side_effect=ProcessOutputLimit("Log limit reached")):
+            self.service.worker("alpha", job["id"])
+        self.assertEqual(self.service.job("alpha")["error_code"], "output_limit")
+        self.assertEqual(self.service.job("alpha")["message"], "Log limit reached")
 
     def test_cancel_during_preview_does_not_publish_a_style(self):
         job = self.request()
@@ -117,6 +124,34 @@ class LaunchTests(unittest.TestCase):
             requirements = self.agents.launch_requirements("opencode", sys.executable)
         self.assertEqual(requirements.environment["CUSTOM_IMAGE_KEY"], "fixture")
         self.assertNotIn("UNRELATED_SECRET", requirements.environment)
+
+    def test_jsonc_comments_do_not_expose_secrets_to_the_sandbox(self):
+        config = self.home / ".config/opencode"
+        config.mkdir(parents=True)
+        (config / "opencode.jsonc").write_text('''{
+            // Disabled integration: {env:COMMENT_SECRET}
+            /* "apiKey": "${BLOCK_SECRET}", */
+            "provider": {"custom": {"options": {
+                "apiKey": "{env:ACTIVE_KEY}",
+                "baseURL": "https://example.invalid/a/*literal*/",
+            }}},
+            "instructions": ["quote: \\\" // still a string",],
+        }''')
+        with patch.dict(os.environ, {"ACTIVE_KEY": "synthetic", "COMMENT_SECRET": "private", "BLOCK_SECRET": "private"}):
+            result = self.launch([sys.executable, "-c", "import os; assert os.environ['ACTIVE_KEY']=='synthetic'; "
+                                 "assert 'COMMENT_SECRET' not in os.environ; assert 'BLOCK_SECRET' not in os.environ"], "opencode")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_malformed_jsonc_does_not_export_environment_references(self):
+        config = self.home / ".config/opencode"
+        config.mkdir(parents=True)
+        for content in ('{"key":"{env:PRIVATE_KEY}", /* unfinished',
+                        '{"key":"{env:PRIVATE_KEY}" trailing}',
+                        '{invalid:"{env:PRIVATE_KEY}"}'):
+            with self.subTest(content=content), patch.dict(os.environ, {"PRIVATE_KEY": "synthetic"}):
+                (config / "opencode.jsonc").write_text(content)
+                requirements = self.agents.launch_requirements("opencode", sys.executable)
+                self.assertNotIn("PRIVATE_KEY", requirements.environment)
 
     def test_custom_install_can_import_its_package_siblings(self):
         package = self.home / "custom-install"

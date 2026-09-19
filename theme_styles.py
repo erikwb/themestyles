@@ -19,7 +19,13 @@ import tomllib
 import opencode_images
 from agents import HARNESS_NAMES, Agents
 from desktop import OmarchyDesktop
-from errors import GenerationError, ProcessCancelled, ProcessTimedOut, StylesError
+from errors import (
+    GenerationError,
+    ProcessCancelled,
+    ProcessOutputLimit,
+    ProcessTimedOut,
+    StylesError,
+)
 from files import (
     lock,
     private_directory,
@@ -299,7 +305,7 @@ class Styles:
         try:
             self.run_process(argv, workspace, "agent.log", timeout=1200,
                              stdin=prompt if self.agents.uses_stdin(selection["harness"]) else None, env=env)
-        except (ProcessCancelled, ProcessTimedOut):
+        except (ProcessCancelled, ProcessOutputLimit, ProcessTimedOut):
             raise
         except StylesError as exc:
             raise self.image_failure(job, workspace, failed=True) from exc
@@ -357,7 +363,8 @@ class Styles:
         argv = ["aether", "--generate", str(image), "--no-apply", "--output", str(output)]
         if mode == "light":
             argv.append("--light-mode")
-        argv, env = sandbox(argv, Path("/aether-home"), output, readonly=[image], writable=[output])
+        argv, env = sandbox(argv, Path("/aether-home"), output, readonly=[image], writable=[output],
+                            outputs={"colors.toml": 65536})
         self.run_process(argv, workspace, "aether.log", timeout=120, env=env)
         colors = output / "colors.toml"
         if not colors.is_file():

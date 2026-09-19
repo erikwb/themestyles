@@ -843,7 +843,7 @@ print("No image tool is configured")
         plugin = self.home / "plugin"
         plugin.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ("theme_styles.py", "agents.py", "opencode_images.py", "harnesses.py", "security.py", "policy.xml", "files.py", "errors.py", "processes.py", "storage.py", "desktop.py", "theme-styles"):
+        for name in ("theme_styles.py", "agents.py", "opencode_images.py", "harnesses.py", "security.py", "sandbox_io.py", "policy.xml", "files.py", "errors.py", "processes.py", "storage.py", "desktop.py", "theme-styles"):
             shutil.copyfile(source / name, plugin / name)
         binaries = self.home / "bin"
         binaries.mkdir()
