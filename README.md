@@ -5,6 +5,8 @@ your current theme. An agent generates the wallpaper; [Aether](https://github.co
 creates matching application colors. Saved styles stay with their original theme
 and do not appear as separate entries in Omarchy's theme picker.
 
+![Winter style applied to the Outpost theme, with saved styles in the panel](preview.png)
+
 ## Install
 
 Requires Omarchy Quattro (tested on 4.0.4), Python 3.11+, Aether, ImageMagick,
@@ -36,6 +38,8 @@ get a number, such as `Winter 2`.
   generation log.
 
 App colors automatically preserve the original theme's light/dark mode.
+
+![Generating a Winter style, with progress and cancellation controls](screenshots/generating.png)
 
 ## Agents
 
